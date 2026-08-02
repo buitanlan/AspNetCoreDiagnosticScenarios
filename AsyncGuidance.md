@@ -21,6 +21,7 @@
    - [Async synchronization with `SemaphoreSlim`](#async-synchronization-with-semaphoreslim)
    - [`AsyncLocal<T>`](#asynclocalt)
    - [Async runtime](#async-runtime)
+     - [Runtime Async (.NET 11)](#runtime-async-net-11)
    - [`ConfigureAwait`](#configureawait)
  - [Scenarios](#scenarios)
    - [Timer callbacks](#timer-callbacks)
@@ -37,7 +38,7 @@ Asynchronous programming is the default model for scalable .NET server apps. Sin
 
 That ubiquity created a second problem: confusion about *how* to use async correctly. Blocking, fire-and-forget, mishandled cancellation, and poorly chosen concurrency primitives still cause production outages years after `async`/`await` shipped.
 
-This guide focuses on practical patterns for modern .NET (**6+**, with callouts for **.NET 8/9** APIs). Examples use bad/good pairs so you can map guidance onto real codebases. Much of this is general-purpose; ASP.NET Core is the primary lens because that is where these mistakes hurt the most.
+This guide focuses on practical patterns for modern .NET (**6+**, with callouts for **.NET 8/9/11** APIs). Examples use bad/good pairs so you can map guidance onto real codebases. Much of this is general-purpose; ASP.NET Core is the primary lens because that is where these mistakes hurt the most. See [Runtime Async (.NET 11)](#runtime-async-net-11) for the runtime-managed async model.
 
 ## Mental model
 
@@ -49,6 +50,7 @@ A few facts that make the rest of this document click (see [Async runtime](#asyn
 4. **ASP.NET Core has no `SynchronizationContext`.** Classic ASP.NET / UI deadlock folklore still matters for libraries and desktop apps, but starvation (not deadlock) is the usual ASP.NET Core failure mode.
 5. **Cancellation is cooperative.** Tokens only work if every layer observes them.
 6. **`ExecutionContext` (including `AsyncLocal`) flows across awaits; `SynchronizationContext` does not**—it is optionally *posted to* after an await, which is what `ConfigureAwait` controls.
+7. **.NET 11 Runtime Async** can move suspend/resume into the CLR (preview opt-in)—same `async`/`await` code, cleaner live stacks and less overhead; it does not change the correctness rules above.
 
 
 
@@ -1405,19 +1407,21 @@ Prints `2, 1, 0`—each async method restores the prior context on the way out.
 
 ## Async runtime
 
-`async`/`await` is language sugar over a compiler-generated **state machine** and the runtime's awaiter / scheduling infrastructure. Understanding that machinery makes `ConfigureAwait`, deadlocks, starvation, and `AsyncLocal` behavior predictable instead of magical.
+`async`/`await` is language sugar over awaitables, continuations, and scheduling. Through .NET 10, the C# compiler rewrote each `async` method into an explicit **state machine**. [.NET 11 Runtime Async](#runtime-async-net-11) moves suspension/resumption into the CLR itself while keeping the same programming model.
 
-Primary references: [Async/Await FAQ](https://devblogs.microsoft.com/dotnet/asyncawait-faq/), [ConfigureAwait FAQ](https://devblogs.microsoft.com/dotnet/configureawait-faq/), [ExecutionContext vs SynchronizationContext](https://devblogs.microsoft.com/dotnet/executioncontext-vs-synchronizationcontext/).
+Understanding either implementation makes `ConfigureAwait`, deadlocks, starvation, and `AsyncLocal` behavior predictable.
 
-### What the compiler generates
+Primary references: [Async/Await FAQ](https://devblogs.microsoft.com/dotnet/asyncawait-faq/), [ConfigureAwait FAQ](https://devblogs.microsoft.com/dotnet/configureawait-faq/), [ExecutionContext vs SynchronizationContext](https://devblogs.microsoft.com/dotnet/executioncontext-vs-synchronizationcontext/), [What's new in the .NET 11 runtime](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-11/runtime).
 
-An `async` method is rewritten into a state machine (`IAsyncStateMachine`) that:
+### What the compiler generates (classic model)
+
+Until Runtime Async, an `async` method is rewritten into a state machine (`IAsyncStateMachine`) that:
 
 1. Runs synchronously from the start of the method (or from the last resume point).
 2. At each `await`, asks the awaitable whether it is already complete (`IsCompleted`).
 3. If complete (**fast path**): continues on the *same* thread with no yield, no context capture for scheduling, and often no allocation beyond what already existed.
-4. If incomplete (**slow path**): captures state, hooks a continuation via `AwaitUnsafeOnCompleted` / `OnCompleted`, and returns an incomplete `Task`/`ValueTask` to the caller.
-5. When the awaited operation finishes, the continuation resumes the state machine at the next state.
+4. If incomplete (**slow path**): boxes/hoists state, hooks a continuation via `AwaitUnsafeOnCompleted` / `OnCompleted`, and returns an incomplete `Task`/`ValueTask` to the caller.
+5. When the awaited operation finishes, the continuation resumes the state machine at the next state (`MoveNext`).
 
 ```C#
 public async Task<int> AddOneAsync()
@@ -1429,11 +1433,113 @@ public async Task<int> AddOneAsync()
 }
 ```
 
-Implications:
+Implications (still true with Runtime Async):
 
 - **`async` ≠ background thread.** CPU work before the first incomplete `await` still runs on the caller.
 - **Already-completed awaits do not force a thread hop.** Hot caches and completed `Task`/`ValueTask` paths stay synchronous through the `await`.
 - **The returned `Task` represents the whole method**, not a particular thread.
+
+Classic-model costs to keep in mind:
+
+- Locals that live across an `await` are hoisted onto the state machine (often heap-allocated once the method suspends).
+- Live stacks fill with `AsyncMethodBuilderCore.Start` / mangled state-machine frames, which hurts profilers and debuggers.
+- Deep async call chains amplify allocation and resume overhead.
+
+### Runtime Async (.NET 11)
+
+[.NET 11 Runtime Async](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-11/runtime) (Runtime Async V2) is a **preview** feature that replaces compiler-generated state-machine classes with **runtime-managed** suspension and resumption. You still write `async`/`await` the same way; the IL and CLR behavior change underneath.
+
+#### Opt in / opt out
+
+```xml
+<PropertyGroup>
+  <!-- Opt in (preview). net11.0 no longer also requires EnablePreviewFeatures for this. -->
+  <Features>runtime-async=on</Features>
+</PropertyGroup>
+```
+
+```xml
+<PropertyGroup>
+  <!-- Opt out / force classic compiler-generated state machines for this project -->
+  <UseRuntimeAsync>false</UseRuntimeAsync>
+</PropertyGroup>
+```
+
+Notes from the [.NET 11 runtime docs](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-11/runtime):
+
+- Runtime libraries themselves ship compiled with `runtime-async=on` (no compiler-generated state machines in those assemblies).
+- With only framework/library dependencies on that model, an app can migrate end-to-end by opting its own projects in.
+- `DOTNET_RuntimeAsync` / `UNSUPPORTED_RuntimeAsync` environment variables were removed; per-project opt-out is `UseRuntimeAsync=false`.
+- Supported for **JIT**, **ReadyToRun**, and **NativeAOT**. R2R can inline await-less async fast paths again.
+
+#### What changes under the hood
+
+| Aspect | Classic compiler state machine | Runtime Async (.NET 11) |
+|--------|--------------------------------|-------------------------|
+| Who owns suspend/resume | Compiler-generated `IAsyncStateMachine` | CLR / JIT runtime-async path |
+| IL shape | Large state machine + `MoveNext` | Method marked for runtime async (e.g. `MethodImplOptions.Async`); simpler IL |
+| Locals across `await` | Conservatively hoisted to fields | Runtime preserves what must survive suspension; unchanged locals avoided |
+| Stack on suspension | State machine commonly boxed to the heap | State kept on stack when it does not escape; heap only when required |
+| Live stack traces | Builder / state-machine frames dominate | Real user methods appear on the stack |
+| Debuggability | Steps into infrastructure | Breakpoints/step-over `await` bind to your source |
+
+Source code does **not** change:
+
+```C#
+static async Task OuterAsync()
+{
+    await Task.CompletedTask;
+    await MiddleAsync();
+}
+
+static async Task MiddleAsync()
+{
+    await Task.CompletedTask;
+    await InnerAsync();
+}
+
+static async Task InnerAsync()
+{
+    await Task.CompletedTask;
+    Console.WriteLine(new StackTrace(fNeedFileInfo: true));
+}
+```
+
+**Without** Runtime Async, a live `StackTrace` is dominated by `AsyncMethodBuilderCore.Start` / state-machine frames (often a dozen+ frames for a short chain).
+
+**With** Runtime Async, the live stack shows the real call chain (`InnerAsync` → `MiddleAsync` → `OuterAsync` → `Main`).
+
+:bulb: **NOTE:** Exception stack traces (`ex.ToString()`) were already cleaned up by `ExceptionDispatchInfo` in the classic model. Runtime Async's big win is **live** stacks (profilers, debuggers, `new StackTrace()` while running).
+
+#### Performance-oriented runtime work (.NET 11)
+
+Relevant improvements that apply to Runtime Async and/or all async continuations:
+
+1. **JIT async support** — dedicated runtime-async codegen for synchronous task-returning methods (less thunk/indirection); tail calls become runtime-async awaits.
+2. **Tail-merged suspension points** — smaller generated code.
+3. **Cached continuations** — reuse continuations for runtime-async callable task thunks.
+4. **Skip empty `ExecutionContext` capture/restore** — if there is no ambient state to restore (no `AsyncLocal` / related data), `Task` / `Task<T>` / `ValueTask` / `ValueTask<T>` continuations skip the capture/restore cycle. High-throughput code that uses `AsyncLocal` sparingly (and often `ConfigureAwait(false)`) benefits.
+5. **Continuation reuse / fewer saved locals** — lower allocation pressure in async-heavy paths.
+6. **Covariant `Task` → `Task<T>` overrides** — virtual dispatch works for both flavors (including NativeAOT).
+7. **Pooled methods opt out** of Runtime Async when pooling already covers them, avoiding redundant work.
+
+#### What Runtime Async does *not* change
+
+Guidance elsewhere in this document still applies:
+
+- Sync-over-async (`.Result` / `.Wait()`) still starves the thread pool.
+- `async void` is still wrong on servers.
+- Cancellation is still cooperative.
+- `ConfigureAwait` still controls `SynchronizationContext` / `TaskScheduler` marshaling—not whether Runtime Async is used.
+- `AsyncLocal` still flows with `ExecutionContext` when ambient state exists (the .NET 11 optimization only skips work when there is nothing to restore).
+- Incomplete awaits still schedule continuations; completed awaits still take the synchronous fast path.
+
+#### Practical adoption tips
+
+- Treat Runtime Async as **preview**: validate throughput, allocations, NativeAOT/R2R, and diagnostics on a representative load test before flipping production.
+- Prefer measuring **your** async chains *and* framework calls; once BCL/ASP.NET bits are runtime-async, wins show up across the stack.
+- Keep writing idiomatic `async`/`await`. Do not rewrite APIs around Runtime Async internals.
+- If a tool assumes classic state-machine IL/frames, update the tool or temporarily opt that project out while investigating.
 
 ### Awaitables and awaiters
 
@@ -1456,7 +1562,7 @@ These are related but not the same thing:
 
 | Concept | Role | Flows across `await`? | Controlled by |
 |---------|------|------------------------|---------------|
-| [`ExecutionContext`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.executioncontext) | Ambient state (`AsyncLocal<T>`, security, etc.) | **Yes** — restored for the continuation | Capture is automatic; `SuppressFlow` / `Unsafe*` APIs are escape hatches |
+| [`ExecutionContext`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.executioncontext) | Ambient state (`AsyncLocal<T>`, security, etc.) | **Yes** — restored for the continuation when present | Capture is automatic; .NET 11 skips no-op capture/restore; `SuppressFlow` / `Unsafe*` are escape hatches |
 | [`SynchronizationContext`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.synchronizationcontext) | App-model scheduler ("run this on the UI / request context") | **No** — not flowed; optionally *posted to* after await | `ConfigureAwait` |
 | [`TaskScheduler`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskscheduler) | TPL scheduler for delegate-backed tasks | Used when no `SynchronizationContext` is present and `ConfigureAwait(true)` captures the current scheduler | `Task.Factory.StartNew`, custom schedulers, `ConfigureAwait` |
 
@@ -1492,6 +1598,8 @@ Blocking pool threads (sync-over-async, sync I/O, long CPU loops without yieldin
 
 ASP.NET Core scalability depends on **not blocking** pool threads during I/O waits. Yielding via incomplete `await` returns the thread to the pool; blocking with `.Result` / `.Wait()` keeps the thread occupied and often requires a *second* thread to finish the work.
 
+Runtime Async can reduce resume/allocation cost, but it **cannot** fix a blocked pool thread.
+
 ### Completed await (fast path) vs incomplete await (slow path)
 
 ```C#
@@ -1502,15 +1610,19 @@ int b = await SlowIoAsync();   // slow path: yield, resume later
 
 This matters for `ConfigureAwait(false)`: if the awaited task is **already complete**, there is nothing to schedule, so `ConfigureAwait(false)` does **not** hop off the current context. Code after that `await` still runs on the caller context. That is why "only `ConfigureAwait(false)` on the first await" is insufficient in libraries—see below.
 
+With Runtime Async, the fast path remains critical: await-less / already-completed chains are where stack-friendly suspension and R2R inlining pay off most.
+
 ### `async void` in the runtime
 
-`async Task` methods report failure on the returned `Task`. `async void` methods are designed for UI event handlers: the runtime posts exceptions to the current `SynchronizationContext` when present, otherwise they can terminate the process. Server apps should treat `async void` as unsupported.
+`async Task` methods report failure on the returned `Task`. `async void` methods are designed for UI event handlers: the runtime posts exceptions to the current `SynchronizationContext` when present, otherwise they can terminate the process. Server apps should treat `async void` as unsupported. Runtime Async does not make `async void` safe on ASP.NET Core.
 
 ### Practical debugging tips
 
 - **Parallel Stacks / Tasks** windows (Visual Studio / Rider) show incomplete awaits and blocked threads.
+- With **Runtime Async (.NET 11)** enabled, live call stacks and step-over-`await` should show your methods instead of builder infrastructure—use that when profiling async depth.
 - A thread stuck in `Wait` / `GetResult` / `Monitor` while others wait for the pool is a classic starvation/deadlock signature.
 - `AsyncLocal` / activity IDs surviving longer than a request often mean an API captured `ExecutionContext` (timers, `CancellationToken.Register`, etc.).
+- Prefer allocation/`EventPipe` profiles before/after `runtime-async=on`; look at Gen0 traffic on deep await chains, not only request latency.
 
 ## `ConfigureAwait`
 
