@@ -1,8 +1,13 @@
-# Common Pitfalls writing scalable services in ASP.NET Core
+# Common pitfalls writing scalable services in ASP.NET Core
 
-This document serves as a guide for writing scalable services in ASP.NET Core. Some of the guidance is general purpose but will be explained through the lens of writing 
-web services. The examples shown here are based on experiences with customer applications and issues found on Github and Stack Overflow.
+Guides for writing scalable ASP.NET Core services. Some of the guidance is general-purpose; the examples use web services because that is where these mistakes hurt most.
 
-- [General ASP.NET Core](AspNetCoreGuidance.md)
-- [Asynchronous Programming](AsyncGuidance.md)
-- [.NET API Gotchas](Gotchas.md)
+| Guide | What it covers |
+|-------|----------------|
+| [AspNetCoreGuidance.md](AspNetCoreGuidance.md) | HTTP pipeline: `HttpContext`, bodies, headers, request DI |
+| [AsyncGuidance.md](AsyncGuidance.md) | `async`/`await`, starvation, `ConfigureAwait`, Runtime Async |
+| [DotnetPattern.md](DotnetPattern.md) | DI, options, factories, modules, tenancy, transactions |
+| [HttpClientGuidance.md](HttpClientGuidance.md) | `HttpClient` lifetime, handlers, platform implementations |
+| [Gotchas.md](Gotchas.md) | BCL: `Random.Shared`, `GeneratedRegex`, `StringComparison`, `ThrowIfNull` |
+
+The examples are based on customer applications and issues found on GitHub and Stack Overflow.
