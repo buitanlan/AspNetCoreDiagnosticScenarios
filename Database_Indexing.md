@@ -1,27 +1,107 @@
-# Database Indexing & Developer Should Known
+# Database Indexing — Những điều developer cần biết
 
 ## Mục lục
 
-- [Nền tảng: Hiểu Index từ gốc rễ](#nền-tảng-hiểu-index-từ-gốc-rễ)
+- [Phần 1. Nền tảng: Hiểu Index từ gốc rễ](#phần-1-nền-tảng-hiểu-index-từ-gốc-rễ)
   - [B+ Tree](#b-tree-không-cần-hiểu-chi-tiết-chỉ-cần-hiểu-ý-tưởng)
-  - [Có sắp xếp hay không: Chuyện của Primary Key](#có-sắp-xếp-hay-không-chuyện-của-primary-key)
-  - [Heap Table và Clustered Index](#hai-cách-lưu-trữ-khác-nhau-heap-table-và-clustered-index)
-  - [Có index chưa chắc query nhanh](#có-index-chưa-chắc-query-nhanh-hiểu-lầm-phổ-biến-nhất)
-- [Bốn nguyên tắc vàng khi sử dụng Index](#bốn-nguyên-tắc-vàng-khi-sử-dụng-index)
-- [Index hoạt động thế nào với từng thao tác SQL](#index-hoạt-động-thế-nào-với-từng-thao-tác-sql)
-- [Tại sao Database không dùng Index của tôi](#tại-sao-database-không-dùng-index-của-tôi)
+  - [Có sắp xếp hay không](#có-sắp-xếp-hay-không-chuyện-của-primary-key)
+  - [Heap vs Clustered](#hai-cách-lưu-trữ-khác-nhau-heap-table-và-clustered-index)
+  - [Có index chưa chắc nhanh](#có-index-chưa-chắc-query-nhanh-hiểu-lầm-phổ-biến-nhất)
+- [Phần 2. Bốn nguyên tắc vàng](#phần-2-bốn-nguyên-tắc-vàng-khi-sử-dụng-index)
+  - [1. Tra cứu nhanh](#nguyên-tắc-1-tra-cứu-nhanh--nhảy-thẳng-đến-vị-trí-cần-tìm)
+  - [2. Quét một hướng](#nguyên-tắc-2-quét-theo-một-hướng)
+  - [3. Phễu trái → phải](#nguyên-tắc-3-từ-trái-sang-phải--nguyên-tắc-phễu-cho-index-nhiều-cột)
+  - [4. Range phá phễu](#nguyên-tắc-4-quét-khi-gặp-điều-kiện-phạm-vi--điều-kiện-phạm-vi-phá-vỡ-phễu)
+- [Phần 3. Đọc execution plan trong 30 giây](#phần-3-đọc-execution-plan-trong-30-giây)
+  - [Đỏ](#đỏ--xử-lý-ngay)
+  - [Vàng](#vàng--chưa-chắc-sai)
+  - [Xanh](#xanh--plan-tốt)
+  - [Checklist 30s](#30-giây--checklist)
+- [Phần 4. Index với từng thao tác SQL](#phần-4-index-hoạt-động-thế-nào-với-từng-thao-tác-sql)
+  - [So sánh không bằng !=](#phép-so-sánh-không-bằng--kẻ-giết-hiệu-suất-thầm-lặng)
+  - [NULL](#null-giá-trị-đặc-biệt-cần-đặc-biệt-chú-ý)
+  - [LIKE](#like-tìm-kiếm-mẫu-chuỗi-và-cái-bẫy-ký-tự-đại-diện-ở-đầu)
+  - [ORDER BY](#order-by-tránh-bước-sort-bổ-sung-bằng-mọi-giá)
+  - [GROUP BY & DISTINCT](#group-by--distinct-thách-thức-lớn-nhất)
+  - [JOIN](#join-phân-tách-và-kết-hợp)
+  - [Subquery](#subquery-không-chậm-như-bạn-nghĩ)
+  - [UPDATE & DELETE](#update--delete-đừng-quên-tối-ưu-cho-chúng)
+- [Phần 5. Tại sao Database không dùng Index](#phần-5-tại-sao-database-không-dùng-index-của-tôi)
+  - [Quy trình thực thi](#quy-trình-thực-thi-query-bên-trong-bộ-não-của-database)
+  - [Index không khớp](#index-không-khớp-với-query-lý-do-phổ-biến-nhất)
+  - [Full scan nhanh hơn](#full-table-scan-nhanh-hơn-khi-database-đúng-mà-bạn-sai)
+  - [Chọn index khác](#database-chọn-index-khác-khi-có-nhiều-lựa-chọn)
   - [Parameter sniffing](#parameter-sniffing-plan-đúng-với-lần-chạy-đầu-sai-với-lần-sau)
   - [Tạo index không khóa bảng](#tạo-và-bảo-trì-index-mà-không-khóa-bảng)
-- [Cạm bẫy và mẹo nâng cao về Indexing](#cạm-bẫy-và-mẹo-nâng-cao-về-indexing)
-- [Kỹ thuật thao tác dữ liệu hiệu quả](#kỹ-thuật-thao-tác-dữ-liệu-hiệu-quả)
-- [Viết query như chuyên gia](#viết-query-như-chuyên-gia)
-- [Thiết kế Schema](#thiết-kế-schema-nền-móng-vững-chắc)
+- [Phần 6. Cạm bẫy và mẹo nâng cao](#phần-6-cạm-bẫy-và-mẹo-nâng-cao-về-indexing)
+  - [Index trên biểu thức](#index-trên-biểu-thức-khi-không-thể-viết-lại-query)
+  - [Cột ít giá trị](#cột-giá-trị-ít-boolean-trạng-thái-khi-index-trở-nên-vô-nghĩa)
+  - [Biến range thành =](#biến-đổi-điều-kiện-phạm-vi-biến-range-thành-so-sánh-bằng)
+  - [Implicit conversion](#kiểu-dữ-liệu-không-khớp-implicit-conversion)
+  - [Covering / index-only](#truy-vấn-chỉ-từ-index-không-cần-chạm-vào-bảng-dữ-liệu)
+  - [Lọc + sort khi JOIN](#lọc-và-sắp-xếp-khi-join-bài-toán-không-giải-được-bằng-index)
+  - [Giới hạn kích thước](#vượt-giới-hạn-kích-thước-index)
+  - [JSON](#json-đánh-index-trong-thế-giới-phi-cấu-trúc)
+  - [UNIQUE và NULL](#ràng-buộc-duy-nhất-và-giá-trị-null-lỗi-bất-ngờ)
+  - [Index không dùng](#tìm-và-dọn-dẹp-index-không-sử-dụng)
+  - [Điều kiện “ma”](#điều-kiện-ma-giúp-database-mà-không-thay-đổi-kết-quả)
+  - [Tìm theo vị trí](#tìm-kiếm-theo-vị-trí-khi-hai-điều-kiện-phạm-vi-đụng-nhau)
+  - [Wildcard ở đầu](#tìm-kiếm-ký-tự-đại-diện-ở-đầu-trường-hợp-đặc-biệt)
+  - [OR trên hai cột](#or-trên-hai-cột-một-index-không-đủ-phễu)
+  - [Index phình to](#index-phình-to-bloat-fragmentation-reindex)
+- [Phần 7. Thao tác dữ liệu hiệu quả](#phần-7-kỹ-thuật-thao-tác-dữ-liệu-hiệu-quả)
+  - [Tranh chấp khóa](#tranh-chấp-khóa-khi-bộ-đếm-bị-nghẽn-cổ-chai)
+  - [UPDATE … JOIN](#cập-nhật-dữ-liệu-từ-bảng-khác-join-trong-update)
+  - [RETURNING / OUTPUT](#lấy-dữ-liệu-ngay-sau-khi-thay-đổi-returning--output)
+  - [Xóa dòng trùng](#xóa-dòng-trùng-lặp-dùng-cte-thay-vì-xử-lý-ở-tầng-ứng-dụng)
+  - [UPSERT](#upsert-insert-hoặc-update-một-lần)
+  - [Xóa / sửa theo lô](#xóa--sửa-theo-lô-đừng-nuốt-cả-bảng-trong-một-transaction)
+  - [Nạp hàng loạt](#nạp-dữ-liệu-hàng-loạt-copy-bulk-insert-sqlbulkcopy)
+- [Phần 8. Viết query như chuyên gia](#phần-8-viết-query-như-chuyên-gia)
+  - [Phân trang theo khóa](#phân-trang-đúng-cách-phân-trang-theo-khóa)
+  - [FOR UPDATE / UPDLOCK](#for-update--updlock-khóa-dòng-ở-tầng-database)
+  - [SKIP LOCKED](#skip-locked-hàng-đợi-không-tranh-chấp)
+  - [EXISTS / NOT EXISTS](#exists-và-not-exists-semi-join--anti-join)
+  - [LATERAL / APPLY](#lateral--cross-apply-top-n-mỗi-nhóm)
+  - [CTE](#biểu-thức-bảng-tạm-cte-xử-lý-query-phức-tạp)
+  - [Tips khác](#các-tips-query-hữu-ích-khác)
+- [Phần 9. Thiết kế Schema](#phần-9-thiết-kế-schema-nền-móng-vững-chắc)
+  - [UUID vs Auto-increment](#uuid-vs-auto-increment-lựa-chọn-primary-key)
+  - [JSON column](#json-column-khi-nosql-gặp-sql)
+  - [Constraint](#constraint-hàng-rào-bảo-vệ-cuối-cùng)
+  - [Exclusion](#ràng-buộc-loại-trừ-chống-chồng-chéo-postgresql)
+  - [Materialized path](#đường-dẫn-vật-lý-hóa-lưu-trữ-cây-đơn-giản)
+  - [Partition](#partition-xóa-data-lớn-trong-tích-tắc)
+  - [Bảng sắp sẵn](#bảng-sắp-xếp-trước-tối-ưu-cho-quét-phạm-vi)
+  - [Tính toán trước](#tính-toán-trước-khi-index-cũng-không-đủ-nhanh)
+  - [Soft delete](#soft-delete-deleted_at-và-index)
+  - [Clustered key hẹp](#khóa-clustered-hẹp-đừng-nhét-uuid-vào-mọi-secondary)
+  - [Multi-tenant](#multi-tenant-tenant_id-đứng-đầu-schema)
+  - [Status / ENUM](#status-enum-lookup-hay-varchar)
+  - [Bảng nối N–N](#bảng-nối-nhiều-nhiều-pk-kép-thay-id-thừa)
+  - [Thời gian](#thời-gian-timestamptz-không-timestamp-without-time-zone)
+- [Phần 10. Checklist](#phần-10-checklist--lỗ-hổng-hay-quên)
+  - [Index khóa ngoại](#luôn-index-khóa-ngoại)
+  - [Đừng SELECT *](#đừng-select--nếu-muốn-covering)
+  - [HOT update](#hot-update-postgresql-và-cột-không-nằm-trong-index)
+  - [BRIN / columnstore](#brin--columnstore-cho-dữ-liệu-append-only)
+  - [Thống kê](#thống-kê-histogram-và-index-có-mà-không-seek)
+  - [Invisible / disable](#invisible--disable-trước-khi-drop)
+  - [Trước khi CREATE INDEX](#trước-khi-create-index)
+- [Bonus. Hiểu sâu B+ Tree trong RDBMS](#bonus-hiểu-sâu-b-tree-trong-rdbms)
+  - [B-tree vs B+ Tree](#b-tree-vs-b-tree-data-chỉ-nằm-ở-lá)
+  - [Page, fanout, chiều cao](#page-fanout-chiều-cao-cây)
+  - [Lá nối nhau](#lá-nối-nhau-vì-sao-range-chỉ-đi-một-hướng)
+  - [Page split](#page-split-random-insert-đắt-hơn-sequential)
+  - [Leaf chứa gì](#leaf-chứa-gì-tid-heap-vs-clustered-key)
+  - [Fillfactor](#fillfactor-chỗ-trống-cố-ý)
+  - [Khi nào không dùng B+ Tree](#khi-nào-không-dùng-b-tree)
 
 > **Quy ước trong ebook:** Ví dụ lấy **PostgreSQL** và **SQL Server (MSSQL)** làm hệ chính. Cú pháp MySQL, Oracle, MariaDB được **giữ nguyên** khi khác biệt — không thay thế, chỉ bổ sung bên cạnh.
 
 
 
-## Nền tảng: Hiểu Index từ gốc rễ
+## Phần 1. Nền tảng: Hiểu Index từ gốc rễ
 
 
 
@@ -47,6 +127,8 @@ Bạn chỉ cần 3 bước thay vì đọc 2000 trang. Index trong database ho�
 
 Từ đây bạn có thể hình dung đơn giản: index = sorted list + bảng tóm tắt giúp nhảy nhanh. Không cần phức tạp hơn thế.
 
+Muốn hiểu *vì sao* random UUID làm page split, leaf chứa TID hay clustered key, fanout ~ vài trăm, đọc [Bonus — B+ Tree trong RDBMS](#bonus-hiểu-sâu-b-tree-trong-rdbms) sau khi xong bốn nguyên tắc. Bốn nguyên tắc không phụ thuộc chi tiết đó.
+
 #### Database tự quản lý index hoàn toàn
 
 Mỗi khi bạn INSERT, UPDATE hay DELETE một row, database tự động cập nhật tất cả các index liên quan:
@@ -66,7 +148,7 @@ Bảng users có 5 index:
 
 Nhưng đừng lo lắng quá: trong thực tế, hầu hết ứng dụng đọc nhiều hơn ghi rất nhiều (tỷ lệ read:write thường là 90:10 hoặc cao hơn), và mỗi bảng thường chỉ cần 3-7 index. Chi phí write thêm cho index hầu như không đáng kể so với lợi ích read mà nó mang lại.
 
-Câu hỏi hay gặp: "Vậy tạo bao nhiêu index là quá nhiều?" Không có con số cố định, nhưng nếu bảng có hơn 10 index và bạn thấy write performance giảm đáng kể, đó là lúc nên review lại. Dùng query kiểm tra unused index (sẽ học ở Phần 5) để tìm và xóa index thừa.
+Câu hỏi hay gặp: "Vậy tạo bao nhiêu index là quá nhiều?" Không có con số cố định, nhưng nếu bảng có hơn 10 index và bạn thấy write performance giảm đáng kể, đó là lúc nên review lại. Dùng query kiểm tra unused index (sẽ học ở Phần 6) để tìm và xóa index thừa.
 
 ### Có sắp xếp hay không: Chuyện của Primary Key
 
@@ -110,7 +192,7 @@ Dữ liệu được append vào cuối file, không quan tâm thứ tự. Bạn
 
 Primary key index cũng hoạt động y hệt: chỉ khác là có UNIQUE constraint.
 
-Điểm quan trọng: vì tất cả index đều bình đẳng (đều trỏ đến vị trí vật lý), không có sự khác biệt performance giữa lookup bằng PK hay bằng secondary index: cả hai đều cần 1 bước nhảy từ index vào table.
+Điểm quan trọng: mọi index (kể cả PK) đều bình đẳng — đều trỏ `ctid`. Lookup PK hay secondary đều là: Seek trên index rồi **fetch heap** (2 bước logic). Khác clustered: PK Seek là xong, không fetch thêm.
 
 #### Clustered Index (SQL Server và MySQL/InnoDB mặc định)
 
@@ -188,7 +270,7 @@ Thực tiễn: auto-increment integer hoặc UUIDv7/ULID (binary, không phải 
 
 Nếu app chủ yếu là CRUD (tìm user theo ID, lấy order theo ID...), clustered index cho performance rất tốt vì data có sẵn ngay khi tìm thấy PK. Đây là lý do SQL Server và MySQL/InnoDB phổ biến với web CRUD.
 
-Bù lại, secondary lookup phải nhảy thêm một bước: **Key Lookup** (SQL Server) hoặc PK lookup (MySQL). Nếu query lấy nhiều cột ngoài index, bước này hàng loạt có thể đắt hơn table scan. Giải pháp: covering index với `INCLUDE` (PostgreSQL, SQL Server) hoặc đưa đủ cột vào index (MySQL 8.0 cũng có `INCLUDE` từ 8.0.13).
+Bù lại, secondary lookup phải nhảy thêm một bước: **Key Lookup** (SQL Server) hoặc PK lookup (MySQL). Nếu query lấy nhiều cột ngoài index, bước này hàng loạt có thể đắt hơn table scan. Giải pháp: covering index — PostgreSQL / SQL Server dùng `INCLUDE` (cột đi kèm, không tham gia sort). **MySQL không có `INCLUDE`**: InnoDB secondary index đã chứa PK, muốn covering thì phải đưa các cột `SELECT` vào *key* của index (index sẽ rộng hơn).
 
 ### Có index chưa chắc query nhanh: Hiểu lầm phổ biến nhất
 
@@ -260,7 +342,7 @@ Quy tắc thực hành: Sau khi tạo index, luôn xem execution plan trước k
 
 Nếu số row đọc >> số row trả về, index chưa đủ tốt (thiếu cột filter, hoặc chưa covering).
 
-## Bốn nguyên tắc vàng khi sử dụng Index
+## Phần 2. Bốn nguyên tắc vàng khi sử dụng Index
 
 Đây là phần quan trọng nhất của cả cuốn ebook. Bốn nguyên tắc này là tất cả những gì bạn cần để tạo index tốt cho bất kỳ query nào. Khi bạn gặp một query chậm, hãy vẽ ra giấy (hoặc hình dung trong đầu) cách query đó map vào index theo 4 nguyên tắc này: đó là cách tốt nhất để xác định index cần tạo.
 
@@ -333,7 +415,7 @@ SELECT * FROM users WHERE age <= 35 ORDER BY age DESC LIMIT 3;
 
 Không có index, query `WHERE age >= 35 ORDER BY age ASC LIMIT 3` trên bảng 10 triệu row phải: scan toàn bộ 10M rows → filter → sort → lấy 3. Với index, chỉ cần: nhảy đến 35 → đọc 3 entries → xong. Chênh lệch có thể từ vài giây xuống dưới 1ms.
 
-Nhưng nhớ: Scan chỉ đi một hướng. Không thể vừa scan ascending vừa scan descending cùng lúc trong một index traversal. Nếu query cần sort theo 2 cột với hướng khác nhau (vd: `ORDER BY score DESC, created_at ASC`), bạn cần tạo index với đúng thứ tự sort đó (xem thêm ở Phần 3 - ORDER BY).
+Nhưng nhớ: Scan chỉ đi một hướng. Không thể vừa scan ascending vừa scan descending cùng lúc trong một index traversal. Nếu query cần sort theo 2 cột với hướng khác nhau (vd: `ORDER BY score DESC, created_at ASC`), bạn cần tạo index với đúng thứ tự sort đó (xem thêm ở Phần 4 - ORDER BY).
 
 ### Nguyên tắc 3: Từ trái sang phải — Nguyên tắc "Phễu" cho index nhiều cột
 
@@ -378,12 +460,12 @@ Mỗi bước "thắt" phễu lại, giảm số entries phải xét. Rất hi�
 Các query dùng được index này:
 
 ```sql
--- ✅ Dùng 3/3 bước phễuChỉ đánh index
+-- ✅ Dùng 3/3 bước phễu
 WHERE country = 'VN' AND lastname = 'Nguyen' AND firstname = 'Huy';
 
 -- ✅ Dùng 2/3 bước phễu (firstname bị bỏ → vẫn OK, chỉ kém tối ưu hơn)
 WHERE country = 'VN' AND lastname = 'Nguyen';
-Chỉ đánh index
+
 -- ✅ Dùng 1/3 bước phễu
 WHERE country = 'VN';
 
@@ -447,7 +529,7 @@ Index entries cho firstname = 'Huy':
 
 So sánh: index hoàn hảo `(firstname, country)` chỉ cần scan 2 entries (đúng entries cần). Với bảng lớn, "firstname = 'Huy'" có thể match hàng trăm nghìn entries → scan tất cả để filter country là rất lãng phí.
 
-Tuy nhiên, skipping a column vẫn tốt hơn không có index: vì ít nhất database giới hạn được phạm vi scan (chỉ entries có firstname = 'Huy'), và có thể filter trên country ngay trong index mà không cần load row từ table.
+Tuy nhiên, bỏ cột giữa vẫn tốt hơn không có index: vì ít nhất database giới hạn được phạm vi scan (chỉ entries có firstname = 'Huy'), và có thể filter trên country ngay trong index mà không cần load row từ table.
 
 #### Index trùng lặp: Dọn dẹp index thừa
 
@@ -559,9 +641,10 @@ Chỉ một cột range có thể hưởng lợi từ index scan. Cột range th
 
 Một số database có thể "nhảy qua" entries trong trường hợp đặc biệt (thường là GROUP BY min/max):
 
-- MySQL: Loose Index Scan
-- Oracle / SQL Server: Skip Scan (optimizer có thể nhảy giữa các nhóm giá trị của cột đầu)
-- PostgreSQL: chưa hỗ trợ Skip Scan — thiếu cột đầu = gần như không dùng được composite index
+- MySQL 8.0.13+: Index Skip Scan (và Loose Index Scan cho một số `GROUP BY`)
+- Oracle: Index Skip Scan
+- SQL Server: **không có** Skip Scan kiểu Oracle. Thiếu cột đầu thường = không Seek được composite index (có thể Index Intersection / Scan, đừng thiết kế dựa vào đó)
+- PostgreSQL 18+: B-tree Skip Scan (bản cũ: thiếu cột đầu ≈ không dùng được composite index)
 
 Nhưng đây là tối ưu đặc biệt, không phải hành vi mặc định. Đừng thiết kế index dựa trên nó.
 
@@ -571,9 +654,92 @@ Nhưng đây là tối ưu đặc biệt, không phải hành vi mặc định. 
 2. Nếu có nhiều range conditions, đặt cột filter được nhiều nhất trước
 3. Sau cột range đầu tiên, các cột tiếp theo chỉ dùng để filter (vẫn hữu ích, nhưng không giới hạn scan range)
 
+`IN (...)` và `IS NULL` tính như **equality** (nhiều seek / một khối NULL). `LIKE 'Nguyen%'` tính như **range**. `!=` / `NOT IN` không đi phễu — xem Phần 4.
 
+#### Bốn nguyên tắc đã đủ chưa?
 
-## Index hoạt động thế nào với từng thao tác SQL
+Đủ cho **cách đi trên index** (seek → scan một hướng → phễu trái→phải → range cắt phễu). Đó đúng 4 thao tác B-tree làm được.
+
+Không nhét thành “nguyên tắc 5”: **covering** (`INCLUDE` / đủ cột trong key) — đó là *sau khi* phễu đúng, đừng nhảy table. **OR hai cột khác nhau** thường không nhét một phễu; cần hai index hoặc viết `UNION ALL`.
+
+Công thức đóng một dòng — vẽ query ra rồi điền:
+
+```text
+INDEX ( equality, equality, … , range_hoặc_ORDER_BY )  INCLUDE ( cột chỉ SELECT )
+```
+
+Xong thì mở plan: seek đúng prefix đó chưa? Lookup/sort còn không? — [30 giây](#phần-3-đọc-execution-plan-trong-30-giây).
+
+## Phần 3. Đọc execution plan trong 30 giây
+
+Không cần thuộc hết operator. Mở **plan thật** (có chạy query), tìm chỗ **đắt nhất**, đối chiếu bảng đỏ dưới đây.
+
+```sql
+-- PostgreSQL (chạy thật + IO)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT ...;
+
+-- SQL Server: Actual Plan (Ctrl+M) — đừng dừng ở Estimated
+SET STATISTICS IO, TIME ON;
+SELECT ...;
+
+-- MySQL 8.0.18+
+EXPLAIN ANALYZE SELECT ...;
+-- hoặc EXPLAIN FORMAT=TREE / EXPLAIN (cột type, Extra, rows)
+```
+
+Cách nhìn 10 giây đầu:
+
+| Hệ | Nhìn gì trước |
+| --- | ------------- |
+| SQL Server | Node **% Cost** cao nhất; mũi tên **dày** = nhiều row. Đọc **phải → trái** |
+| PostgreSQL | `actual time` / `Buffers` lớn nhất; so `rows` ước lượng vs `actual rows` |
+| MySQL | Cột `type` + `Extra`; `rows` × số vòng join |
+
+### Đỏ — xử lý ngay
+
+| Operator (SQL Server) | PostgreSQL | MySQL `type` / Extra | Nghĩa |
+| --------------------- | ---------- | -------------------- | ----- |
+| **Table Scan** / **Clustered Index Scan** trên bảng lớn, filter hẹp | **Seq Scan** + `Filter` trên bảng lớn | `ALL` | Không dùng index, hoặc index vô dụng (hàm trên cột, sai kiểu, selectivity cao) |
+| **Index Scan** hết index rồi filter | Seq/Index Scan + Filter | `index` (full index scan) | Đi cả lá index — gần đắt như table scan |
+| **Key Lookup** / **RID Lookup** × hàng chục nghìn | **Index Scan** + heap fetch; Index Only Scan với **Heap Fetches** lớn | (InnoDB: PK lookup sau secondary) | Index không covering → `INCLUDE` / thêm cột vào key |
+| **Sort** có warning **spill to tempdb** | Sort **external merge Disk**; `BUFFERS` đọc file | `Using filesort` | Thiếu index khớp `ORDER BY` (nguyên tắc 2 + 4) |
+| **Hash Match** spill; memory grant khổng lồ | Hash Join / HashAggregate **Batches: Disk** | `Using temporary` | Join/GROUP BY không được index; hoặc thống kê sai |
+| **Nested Loops** outer lớn × inner Scan | Nested Loop `loops` lớn × inner Seq Scan | `type=ALL` ở bảng trong join | Inner chưa Seek được — thiếu index join/FK |
+| **Compute Scalar** `CONVERT_IMPLICIT` | (cast cột) | `type=ALL` dù có index | Sai kiểu dữ liệu (Phần 6 — implicit conversion) |
+
+Mũi tên / row count: Seek 5 row rồi Lookup 200.000 lần = đỏ, dù operator tên “Seek”.
+
+### Vàng — chưa chắc sai
+
+- **Bitmap Heap Scan** / **Bitmap Index Scan** (PG): nhiều match, đọc heap theo block — ổn ở độ chọn lọc trung bình.
+- **Index Scan** / Clustered Scan khi bạn **cần** phần lớn bảng (report, `WHERE 1=1`).
+- **Nested Loops** khi phía ngoài vài chục row và inner là **Seek**.
+- **Hash Join** in-memory trên hai tập lớn: thường *đúng*, đừng đổi thành Nested Loop.
+
+### Xanh — plan tốt
+
+- **Index Seek** / **Index Only Scan** / `type=ref` hoặc `const`
+- Seek đúng prefix phễu, không Lookup (covering), không Sort
+- `actual rows` ≈ `estimated rows` (lệch < ~10×)
+
+### 30 giây — checklist
+
+1. Plan **Actual**, không phải Estimated.
+2. Node / dòng đắt nhất là gì? Scan bảng lớn? Lookup? Sort disk? Nested Loop nổ?
+3. Map về 4 nguyên tắc: thiếu equality trái? Range đứng trước equality? `ORDER BY` lệch hướng? Chưa covering?
+4. `estimated` lệch `actual` một hoặc hai bậc 10 → **thống kê / parameter sniffing** (Phần 5), chưa chắc thiếu index.
+5. Sửa **một** thứ (index hoặc viết lại SARGable), chạy lại plan — đừng thêm 4 index một lúc.
+
+```
+Seq Scan / ALL / Clustered Scan (bảng lớn, filter hẹp)  →  index hoặc viết lại WHERE
+Key Lookup × N lớn                                      →  covering
+Sort / filesort / spill                                 →  index đúng ORDER BY
+Nested Loop × inner Scan                                →  index cho join / FK
+estimated ≪ actual                                      →  ANALYZE / UPDATE STATISTICS / sniffing
+```
+
+## Phần 4. Index hoạt động thế nào với từng thao tác SQL
 
 Bốn nguyên tắc ở Phần 2 là nền tảng. Giờ chúng ta sẽ xem chúng hoạt động thế nào với các SQL operation phức tạp hơn. Một điều quan trọng cần nhớ: thứ tự thực thi SQL không giống thứ tự bạn viết. Database thực thi theo thứ tự:
 
@@ -736,7 +902,7 @@ ORDER BY severity DESC, created_at DESC;
 
 Disk-based sort có thể biến query 10ms thành 10 giây.
 
-- **PostgreSQL:** tăng `work_mem` (mặc định 4MB → 32–64MB cho session/query nặng). Áp dụng **per sort/hash operation**, không phải per server.
+- **PostgreSQL:** tăng `work_mem` cho *session/query nặng* (mặc định 4MB → 16–64MB). Áp dụng **per sort/hash operation**, không phải per server. Cảnh báo: `work_mem` × số operation × số connection có thể ăn hết RAM — đừng set 64MB global trên server 500 connection.
 - **SQL Server:** không có knob tương đương từng query. Memory grant do optimizer quyết. Theo dõi spill to `tempdb` trong plan (`Sort` / `Hash Match` có warning). Giảm spill bằng index đúng thứ tự sort, hoặc covering để khỏi sort.
 - **MySQL:** tăng `sort_buffer_size` (mặc định 256KB → 4–8MB). Cẩn thận: setting này apply per-operation / per-thread.
 
@@ -776,7 +942,7 @@ Quy tắc:
 
 - Simple GROUP BY: index cùng cột, cùng thứ tự
 - GROUP BY + WHERE: cột WHERE đặt trước (WHERE chạy trước GROUP BY)
-- GROUP BY + WHERE range: range phá vỡ phễu → không loop-and-count được. Giải pháp: biến range thành equality (xem Phần 5)
+- GROUP BY + WHERE range: range phá vỡ phễu → không loop-and-count được. Giải pháp: biến range thành equality (xem Phần 6)
 - Aggregate (AVG, SUM, MAX): đặt cột aggregate cuối index để index-only
 
 Khi GROUP BY trên primary key, không cần liệt kê các cột khác của cùng bảng:
@@ -861,7 +1027,7 @@ SELECT * FROM logs WHERE created_at < '2024-01-01';
 
 
 
-## Tại sao Database không dùng Index của tôi
+## Phần 5. Tại sao Database không dùng Index của tôi
 
 Đây là câu hỏi gây bực bội nhất mà developer hay gặp. Index đã tạo, query rõ ràng match — nhưng database vẫn lờ tịt.
 
@@ -995,7 +1161,7 @@ SELECT * FROM orders WHERE status = @status OPTION (RECOMPILE);
 -- Hoặc OPTIMIZE FOR UNKNOWN — dùng density trung bình, không sniff giá trị cụ thể
 ```
 
-**PostgreSQL** có generic plan vs custom plan (prepared statement). Nếu thấy plan "lạ" sau `PREPARE`/`EXECUTE`, thử `DISCARD PLANS` hoặc không prepare query có selectivity thay đổi mạnh.
+**PostgreSQL** prepared statement: generic plan vs custom plan. Query selectivity đổi mạnh → `SET plan_cache_mode = force_custom_plan` (PG 12+) hoặc đừng prepare. SQL Server 2022+ có **Parameter Sensitive Plan (PSP)** — optimizer có thể cache nhiều plan theo dải tần suất; vẫn nên `UPDATE STATISTICS` và cân `OPTION (RECOMPILE)` cho outlier.
 
 **MySQL:** prepared statement cũng cache plan; `ANALYZE TABLE` sau khi phân bố đổi.
 
@@ -1021,7 +1187,7 @@ CREATE INDEX idx_orders_status ON orders (status);
 
 
 
-## Cạm bẫy và mẹo nâng cao về Indexing
+## Phần 6. Cạm bẫy và mẹo nâng cao về Indexing
 
 
 
@@ -1165,13 +1331,16 @@ SELECT user_id FROM user_roles WHERE role_id = 1;   -- index-only
 `INCLUDE` thêm cột "đi kèm" mà không tham gia sort / UNIQUE:
 
 ```sql
--- PostgreSQL, SQL Server, MySQL 8.0.13+
+-- PostgreSQL, SQL Server (không có trên MySQL)
 CREATE INDEX invoices_covering
 ON invoices (customer_id, year)
 INCLUDE (price);
+
+-- MySQL: covering = đưa cột SELECT vào key (InnoDB secondary đã chứa PK)
+-- CREATE INDEX invoices_covering ON invoices (customer_id, year, price);
 ```
 
-Dùng `INCLUDE` khi chỉ cần cột đó để tránh nhảy vào bảng (Index Only Scan / covering), không cần filter hay sort theo cột đó. Đặt cột filter/sort trong key; cột chỉ `SELECT` thì để `INCLUDE`.
+Dùng `INCLUDE` khi chỉ cần cột đó để tránh nhảy vào bảng (Index Only Scan / covering), không cần filter hay sort theo cột đó. Đặt cột filter/sort trong key; cột chỉ `SELECT` thì để `INCLUDE`. MySQL: nhét vào key, chấp nhận index to hơn.
 
 ### Lọc và sắp xếp khi JOIN: Bài toán không giải được bằng index
 
@@ -1237,7 +1406,7 @@ WHERE shipment_id IS NOT NULL;
 -- (không chặn nhiều row (customer_id, NULL) — nếu cần chặn, dùng filtered
 --  index riêng hoặc computed column thay NULL bằng sentinel)
 
--- Mọi hệ: thay NULL bằng giá trị đặc biệt trong biểu thức / computed column
+-- PostgreSQL: expression index (SQL Server / MySQL: computed / generated column rồi UNIQUE)
 CREATE UNIQUE INDEX one_pending_order ON orders (
   customer_id,
   (CASE WHEN shipment_id IS NULL THEN -1 ELSE shipment_id END)
@@ -1282,14 +1451,38 @@ ORDER BY count_star;
 
 ### Điều kiện "ma": Giúp database mà không thay đổi kết quả
 
-Thêm điều kiện thừa theo quy tắc nghiệp vụ để database dùng thêm cột index. Ghi chú rõ trong code — nếu rule đổi, query sẽ lọc sai.
+Thêm predicate **thừa về mặt nghiệp vụ** (không đổi kết quả) để optimizer bám đúng index. Ghi chú cạnh query: nếu rule đổi, điều kiện “ma” sẽ lọc sai.
+
+Ví dụ: mỗi user thuộc đúng một `org_id`. Index hay dùng là `(org_id, created_at)` vì hầu hết query đa tenant đều lọc org trước. Query “bài viết của tôi” chỉ cần `user_id` vẫn **đúng**, nhưng Seek vào `(org_id, created_at)` thì không.
+
+```sql
+-- Index: posts (org_id, created_at)  — user_id không đứng đầu phễu
+-- Nghiệp vụ: user 17 luôn thuộc org 42
+
+-- ❌ đúng kết quả, dễ Seq Scan / lookup theo user_id (nếu có)
+SELECT * FROM posts
+WHERE user_id = 17
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- ✅ cùng kết quả, Seek (org_id) rồi scan created_at
+SELECT * FROM posts
+WHERE org_id = 42          -- "ma": suy ra từ session, không đổi kết quả
+  AND user_id = 17
+ORDER BY created_at DESC
+LIMIT 20;
+-- Index tốt hơn: (org_id, user_id, created_at) hoặc (user_id, created_at)
+```
+
+Chỉ thêm “ma” khi bạn **chắc** invariant (tenant, `deleted_at IS NULL`, `status IN (...)` luôn đúng). Không dùng để “đánh lừa” optimizer khi dữ liệu không thật sự thoả.
 
 ### Tìm kiếm theo vị trí: Khi hai điều kiện phạm vi đụng nhau
 
 Longitude + latitude = hai range → index B-tree chỉ dùng được một. Dùng Spatial Index (R-tree / GIST).
 
 ```sql
--- PostgreSQL
+-- PostgreSQL (cần extension btree_gist nếu `type` không phải geometry)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE INDEX search_idx ON businesses USING GIST (type, location);
 SELECT * FROM businesses
 WHERE type = 'restaurant'
@@ -1306,13 +1499,81 @@ WHERE type = 'restaurant'
 CREATE SPATIAL INDEX search_idx ON businesses (location);
 ```
 
-PostgreSQL hỗ trợ nhiều cột trên GiST + SRID 4326. MySQL spatial index chỉ 1 cột. SQL Server có `geography` / `geometry` + spatial index riêng.
+PostgreSQL GiST nhiều cột: scalar + geometry cần `btree_gist`. MySQL spatial index chỉ 1 cột. SQL Server: `geography` / `geometry` + spatial index riêng; filter `type` thường cần index B-tree riêng (spatial index không “gói” equality như GiST đa cột).
 
 ### Tìm kiếm ký tự đại diện ở đầu: Trường hợp đặc biệt
 
-`LIKE '%abc%'` không dùng B-tree. PostgreSQL: trigram index (`pg_trgm`). MySQL/SQL Server: dùng search engine chuyên biệt.
+`LIKE 'abc%'` là range (nguyên tắc 4) → B-tree dùng được. `LIKE '%abc'` / `'%abc%'` **không** đi từ trái lá index → B-tree vô dụng.
 
-## Kỹ thuật thao tác dữ liệu hiệu quả
+```sql
+-- PostgreSQL: trigram (substring, ILIKE)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX users_name_trgm ON users USING GIN (name gin_trgm_ops);
+SELECT * FROM users WHERE name ILIKE '%nguyen%';
+
+-- PostgreSQL: full-text (từ, ngôn ngữ, ranking — không phải substring thuần)
+CREATE INDEX articles_fts ON articles USING GIN (to_tsvector('simple', title || ' ' || body));
+SELECT * FROM articles
+WHERE to_tsvector('simple', title || ' ' || body) @@ plainto_tsquery('simple', 'indexing btree');
+
+-- SQL Server: Full-Text (không phải B-tree)
+-- CREATE FULLTEXT CATALOG ft AS DEFAULT;
+-- CREATE FULLTEXT INDEX ON users(name) KEY INDEX pk_users;
+SELECT * FROM users WHERE CONTAINS(name, '"nguyen"');
+
+-- MySQL: FULLTEXT (InnoDB) — ngram parser cho CJK / substring ngắn
+ALTER TABLE users ADD FULLTEXT INDEX users_name_ft (name);
+SELECT * FROM users WHERE MATCH(name) AGAINST ('nguyen' IN BOOLEAN MODE);
+```
+
+`pg_trgm` / FULLTEXT **không** thay B-tree cho equality, FK, `ORDER BY` theo thời gian. Một cột search + một cột sort: thường **hai** index, hoặc GIN + sort ngoài — xem plan (Sort / Bitmap).
+
+### OR trên hai cột: Một index không đủ phễu
+
+`WHERE email = @e OR phone = @p` không đi một phễu `(email, phone)`. Optimizer hay Bitmap OR hai index, hoặc **bỏ index**. Tách thành hai Seek rồi `UNION ALL`:
+
+```sql
+-- ❌ một cây, hai nhánh OR
+SELECT * FROM users WHERE email = @e OR phone = @p;
+
+-- ✅ mỗi nhánh một index: (email), (phone)
+SELECT * FROM users WHERE email = @e
+UNION ALL
+SELECT * FROM users WHERE phone = @p
+  AND (email IS DISTINCT FROM @e);  -- tránh trùng nếu cả hai khớp
+-- SQL Server: AND (email <> @e OR email IS NULL)
+```
+
+`OR` trên **cùng** cột (`status IN (...)` / `status = 'a' OR status = 'b'`) vẫn là equality — nguyên tắc 1, không phải pattern này.
+
+### Index phình to: Bloat, fragmentation, REINDEX
+
+Index không co lại khi `DELETE` / `UPDATE` cột key. Chỗ trống nằm rải — scan cùng số row nhưng **nhiều page hơn**.
+
+```sql
+-- PostgreSQL: bloat ước lượng (cần pgstattuple cho số chính xác)
+SELECT relname, pg_size_pretty(pg_relation_size(indexrelid)) AS index_size, idx_scan
+FROM pg_stat_user_indexes
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- REINDEX không khóa đọc/ghi lâu (PG 12+)
+REINDEX INDEX CONCURRENTLY users_email_idx;
+-- VACUUM (FULL) không phải cách dọn index thường ngày
+
+-- SQL Server
+SELECT OBJECT_NAME(ips.object_id), i.name, ips.avg_fragmentation_in_percent, ips.page_count
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED') ips
+JOIN sys.indexes i ON i.object_id = ips.object_id AND i.index_id = ips.index_id
+WHERE ips.page_count > 1000
+ORDER BY ips.avg_fragmentation_in_percent DESC;
+
+ALTER INDEX users_email_idx ON users REORGANIZE;           -- nhẹ
+ALTER INDEX users_email_idx ON users REBUILD WITH (ONLINE = ON);  -- Enterprise / một số edition
+```
+
+Rebuild khi fragmentation / bloat **cao và index hay được scan**. Seek vào 1–2 leaf không đau vì index “xốp”. Fillfactor / `FILLFACTOR` thấp hơn 100 trên bảng update-nhiều giảm page split — đổi khi tạo index, không phải query.
+
+## Phần 7. Kỹ thuật thao tác dữ liệu hiệu quả
 
 
 
@@ -1321,10 +1582,10 @@ PostgreSQL hỗ trợ nhiều cột trên GiST + SRID 4326. MySQL spatial index 
 Phân tán counter thành nhiều row (fanout) để update song song:
 
 ```sql
--- MySQL
+-- MySQL 8.0.20+: alias thay cho VALUES() (đã deprecated)
 INSERT INTO post_statistics (post_id, fanout, likes_count)
-VALUES (1475870220422107137, FLOOR(RAND() * 100), 1)
-ON DUPLICATE KEY UPDATE likes_count = likes_count + VALUES(likes_count);
+VALUES (1475870220422107137, FLOOR(RAND() * 100), 1) AS new_row
+ON DUPLICATE KEY UPDATE likes_count = likes_count + new_row.likes_count;
 
 -- PostgreSQL
 INSERT INTO post_statistics (post_id, fanout, likes_count)
@@ -1379,8 +1640,7 @@ DELETE FROM sessions
 OUTPUT deleted.id, deleted.user_agent, deleted.last_access
 WHERE ip = '127.0.0.1';
 
--- MySQL 8.0.21+: RETURNING cho một số statement (MariaDB hỗ trợ rộng hơn)
--- DELETE FROM sessions WHERE ip = '127.0.0.1' RETURNING id, user_agent, last_access;
+-- MariaDB: RETURNING (INSERT/DELETE/REPLACE). MySQL 8.x **không** có RETURNING.
 ```
 
 
@@ -1388,6 +1648,7 @@ WHERE ip = '127.0.0.1';
 ### Xóa dòng trùng lặp: Dùng CTE thay vì xử lý ở tầng ứng dụng
 
 ```sql
+-- PostgreSQL
 WITH duplicates AS (
   SELECT id, ROW_NUMBER() OVER (
     PARTITION BY firstname, lastname, email
@@ -1400,14 +1661,101 @@ USING duplicates
 WHERE contacts.id = duplicates.id AND duplicates.rownum > 1;
 
 -- SQL Server
--- DELETE c FROM contacts c
--- INNER JOIN duplicates d ON c.id = d.id
--- WHERE d.rownum > 1;
+WITH duplicates AS (
+  SELECT id, ROW_NUMBER() OVER (
+    PARTITION BY firstname, lastname, email
+    ORDER BY age DESC
+  ) AS rownum
+  FROM contacts
+)
+DELETE c
+FROM contacts c
+INNER JOIN duplicates d ON c.id = d.id
+WHERE d.rownum > 1;
 ```
 
+### UPSERT: INSERT hoặc UPDATE một lần
 
+Race “SELECT rồi INSERT/UPDATE” ở app = hai request cùng lúc, mất unique. Một statement, unique key làm trọng tài.
 
-## Viết query như chuyên gia
+```sql
+-- PostgreSQL
+INSERT INTO settings (user_id, theme)
+VALUES (42, 'dark')
+ON CONFLICT (user_id)
+DO UPDATE SET theme = EXCLUDED.theme, updated_at = now()
+RETURNING *;
+
+-- SQL Server 2008+: MERGE (khóa range nếu không có unique đúng cột)
+MERGE settings WITH (HOLDLOCK) AS t
+USING (SELECT 42 AS user_id, 'dark' AS theme) AS s
+ON t.user_id = s.user_id
+WHEN MATCHED THEN UPDATE SET theme = s.theme, updated_at = SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (user_id, theme) VALUES (s.user_id, s.theme);
+
+-- SQL Server 2022+: có thể INSERT … ON. (tùy edition); pattern cũ hay dùng:
+-- UPDATE … IF @@ROWCOUNT = 0 INSERT …  trong một transaction + unique index
+
+-- MySQL 8.0.20+: alias, đừng dùng VALUES() deprecated
+INSERT INTO settings (user_id, theme)
+VALUES (42, 'dark') AS new_row
+ON DUPLICATE KEY UPDATE theme = new_row.theme;
+```
+
+Cần **UNIQUE** (hoặc PK) trên khóa xung đột. `MERGE` SQL Server dễ deadlock / race nếu thiếu unique và `HOLDLOCK`. PostgreSQL `ON CONFLICT ON CONSTRAINT …` rõ hơn “cột nào thắng”.
+
+### Xóa / sửa theo lô: Đừng nuốt cả bảng trong một transaction
+
+`DELETE FROM logs WHERE created_at < …` mười triệu row = WAL/log khổng lồ, lock lâu, replica tụt, `VACUUM` / index phình (Phần 6). Cắt lô nhỏ, commit giữa chừng:
+
+```sql
+-- PostgreSQL: lặp đến khi 0 row
+DELETE FROM logs
+WHERE ctid IN (
+  SELECT ctid FROM logs
+  WHERE created_at < DATE '2024-01-01'
+  LIMIT 5000
+);
+
+-- SQL Server
+DELETE TOP (5000)
+FROM logs
+WHERE created_at < '20240101';
+
+-- MySQL
+DELETE FROM logs
+WHERE created_at < '2024-01-01'
+LIMIT 5000;
+```
+
+App loop + sleep ngắn nếu replication lag. Xóa theo partition (`DROP` / `TRUNCATE` partition) rẻ hơn DELETE khi dữ liệu theo tháng — Phần 9.
+
+`UPDATE` hàng loạt cùng bài: đừng set 5 triệu row một phát (lock + WAL + index maintain). Cột nằm trong index: mỗi lô còn đắt hơn (Phần 10, HOT).
+
+### Nạp dữ liệu hàng loạt: COPY, BULK INSERT, SqlBulkCopy
+
+`INSERT` từng row từ app = parse + plan + WAL + index cho mỗi câu. Nạp file / stream:
+
+```sql
+-- PostgreSQL (file trên server; từ client: \copy trong psql, hoặc Npgsql COPY)
+COPY staging_users (email, name)
+FROM '/tmp/users.csv' WITH (FORMAT csv, HEADER true);
+-- UNLOGGED TABLE / disable index rồi rebuild: chỉ staging, không phải bảng live có replica
+
+-- SQL Server
+BULK INSERT staging_users
+FROM 'C:\tmp\users.csv'
+WITH (FIRSTROW = 2, FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', TABLOCK);
+
+-- MySQL
+LOAD DATA LOCAL INFILE '/tmp/users.csv'
+INTO TABLE staging_users
+FIELDS TERMINATED BY ',' IGNORE 1 LINES (email, name);
+```
+
+App: PostgreSQL `COPY FROM STDIN`; SQL Server `SqlBulkCopy` + `TABLOCK` khi được. Load xong `ANALYZE` / `UPDATE STATISTICS` — không thì Phần 5 (plan sai vì histogram cũ).
+
+## Phần 8. Viết query như chuyên gia
 
 
 
@@ -1456,11 +1804,113 @@ UPDATE account SET balance = 540 WHERE account_id = 7;
 COMMIT;
 ```
 
+`FOR UPDATE` / `UPDLOCK` giữ khóa đến hết transaction. Thiếu index trên `account_id` → khóa **scan**, không phải một row. Timeout / deadlock: khóa cùng thứ tự bảng (users rồi orders, không ngược).
 
+### SKIP LOCKED: Hàng đợi không tranh chấp
+
+Nhiều worker `SELECT … FOR UPDATE` cùng hàng đợi → xếp hàng, hoặc deadlock. Bỏ qua row đang khóa, lấy việc còn trống:
+
+```sql
+-- PostgreSQL 9.5+ / MySQL 8.0.1+
+BEGIN;
+SELECT id, payload
+FROM job_queue
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- xử lý rồi UPDATE status = 'done'
+COMMIT;
+
+-- SQL Server (READPAST: bỏ row bị khóa; UPDLOCK: mình khóa row lấy được)
+BEGIN TRAN;
+SELECT TOP (1) id, payload
+FROM job_queue WITH (UPDLOCK, READPAST, ROWLOCK)
+WHERE status = 'pending'
+ORDER BY id;
+COMMIT;
+```
+
+Index `(status, id)` (hoặc filtered `WHERE status = 'pending'`). `SKIP LOCKED` **không** phải isolation “không bao giờ miss”: row đang khóa sẽ do worker khác làm. Không dùng cho “đọc đủ mọi row đúng một lần trong cùng statement” — dùng cho queue.
+
+### EXISTS và NOT EXISTS: Semi-join / anti-join
+
+`EXISTS` chỉ cần **biết có** row khớp, không kéo cả tập con. `IN (subquery)` dễ gãy với `NULL` (`NOT IN` + NULL = không ra row). Anti-join chuẩn: `NOT EXISTS`.
+
+```sql
+-- Khách có ít nhất một đơn 2024 — semi-join, index orders (customer_id, created_at)
+SELECT c.id, c.name
+FROM customers c
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.customer_id = c.id
+    AND o.created_at >= TIMESTAMP '2024-01-01'
+    AND o.created_at <  TIMESTAMP '2025-01-01'
+);
+
+-- Khách không có đơn — đừng NOT IN (SELECT customer_id …) khi cột nullable
+SELECT c.id
+FROM customers c
+WHERE NOT EXISTS (
+  SELECT 1 FROM orders o WHERE o.customer_id = c.id
+);
+```
+
+`COUNT(*) > 0` trong subquery = làm hết việc rồi mới so sánh. `EXISTS` dừng ở row đầu. Plan: Nested Loop Semi Join / Anti Join + Seek, không Hash cả bảng orders nếu selectivity tốt.
+
+### LATERAL / CROSS APPLY: Top-N mỗi nhóm
+
+“3 đơn mới nhất mỗi khách” — `ROW_NUMBER()` rồi filter `rn <= 3` đúng nhưng sort **cả** orders. `LATERAL` / `APPLY` = với mỗi khách, Seek 3 row trên `(customer_id, created_at DESC)`.
+
+```sql
+-- PostgreSQL
+SELECT c.id, o.id AS order_id, o.created_at
+FROM customers c
+CROSS JOIN LATERAL (
+  SELECT id, created_at
+  FROM orders
+  WHERE customer_id = c.id
+  ORDER BY created_at DESC
+  LIMIT 3
+) o;
+
+-- SQL Server
+SELECT c.id, o.id AS order_id, o.created_at
+FROM customers c
+CROSS APPLY (
+  SELECT TOP (3) id, created_at
+  FROM orders
+  WHERE customer_id = c.id
+  ORDER BY created_at DESC
+) o;
+```
+
+Chỉ rẻ khi **số nhóm nhỏ** (hoặc đã filter khách) và index `(customer_id, created_at DESC)` — covering nếu SELECT đủ cột. Hàng triệu khách × LATERAL = Nested Loop nổ; lúc đó window + filter có thể thắng. Đọc plan (Phần 3).
 
 ### Biểu thức bảng tạm (CTE): Xử lý query phức tạp
 
-Chia query thành bước nhỏ, mỗi CTE test độc lập — dễ debug hơn nested subquery.
+Chia query thành bước nhỏ, mỗi CTE test độc lập — dễ debug hơn subquery lồng.
+
+CTE **không** phải bảng tạm trên đĩa. PostgreSQL (đến 11 inlined; 12+ có thể materialize): CTE bị đọc nhiều lần hoặc tối ưu kém hơn subquery. Ép: `AS MATERIALIZED` / `NOT MATERIALIZED` (PG 12+). SQL Server: CTE thường inlined; spool khi recursive hoặc optimizer chọn spool.
+
+```sql
+-- Recursive: cây category (cần index parent_id)
+WITH RECURSIVE tree AS (
+  SELECT id, parent_id, name, 0 AS depth
+  FROM categories
+  WHERE id = 10
+  UNION ALL
+  SELECT c.id, c.parent_id, c.name, tree.depth + 1
+  FROM categories c
+  JOIN tree ON c.parent_id = tree.id
+  WHERE tree.depth < 20          -- chặn chu trình / sâu vô hạn
+)
+SELECT * FROM tree;
+
+-- SQL Server: WITH tree AS (anchor UNION ALL recursive) — không ghi RECURSIVE
+```
+
+Cây sâu / graph: materialized path (Phần 9) thường rẻ hơn recursive trên mọi request.
 
 ### Các tips query hữu ích khác
 
@@ -1500,20 +1950,22 @@ FROM movies;
 -- DISTINCT ON (PostgreSQL): đơn đắt nhất mỗi customer
 SELECT DISTINCT ON (customer_id) *
 FROM orders
-WHERE EXTRACT(YEAR FROM created_at) = 2024
+WHERE created_at >= TIMESTAMP '2024-01-01'
+  AND created_at <  TIMESTAMP '2025-01-01'
 ORDER BY customer_id ASC, price DESC;
+-- (tránh EXTRACT(YEAR FROM created_at) / YEAR(created_at) — hàm trên cột = không SARGable)
 
 -- SQL Server / MySQL: cùng ý tưởng bằng ROW_NUMBER()
 SELECT * FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY price DESC) AS rn
   FROM orders
-  WHERE YEAR(created_at) = 2024
+  WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01'
 ) t WHERE rn = 1;
 ```
 
 
 
-## Thiết kế Schema: Nền móng vững chắc
+## Phần 9. Thiết kế Schema: Nền móng vững chắc
 
 
 
@@ -1664,3 +2116,277 @@ SELECT total_likes FROM articles_stats
 WHERE user_id = 1 AND publish_year = 2024;
 ```
 
+### Soft delete: `deleted_at` và index
+
+`deleted_at IS NULL` = “còn sống” xuất hiện gần như mọi query. Index thường `(user_id, created_at)` **không** biết soft-delete → Seek xong vẫn lọc xác, hoặc bitmap cả đống row đã xóa.
+
+```sql
+-- PostgreSQL: partial — chỉ lá “còn sống”
+CREATE INDEX orders_user_live
+ON orders (user_id, created_at DESC)
+WHERE deleted_at IS NULL;
+
+SELECT * FROM orders
+WHERE user_id = 42
+  AND deleted_at IS NULL          -- phải có đúng predicate này
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- SQL Server: filtered index
+CREATE INDEX orders_user_live
+ON orders (user_id, created_at DESC)
+WHERE deleted_at IS NULL;
+```
+
+Query **phải** ghi `deleted_at IS NULL` (hoặc predicate chặt hơn) thì optimizer mới dùng. Unique “một email active”: `UNIQUE (email) WHERE deleted_at IS NULL` — cùng email xóa mềm được insert lại. Đừng biến `deleted_at` thành cột hay sửa trên index “nóng” nếu bảng update dày (HOT / page split — Phần 10, Bonus).
+
+### Khóa clustered hẹp: Đừng nhét UUID vào mọi secondary
+
+SQL Server và InnoDB: mọi nonclustered index **mang theo clustered key** (thường là PK) ở leaf. PK `UNIQUEIDENTIFIER` / `CHAR(36)` 16–36 byte → nhân với số index → leaf phình, cache miss.
+
+| PK clustered | Secondary `(email)` leaf chứa |
+| ------------ | ----------------------------- |
+| `INT` / `BIGINT` identity | email + 4–8 byte |
+| UUIDv4 | email + 16 byte (+ fragmentation, Phần 1) |
+
+Công thức: **PK nội bộ hẹp, tăng dần**; UUID/ULID là cột unique riêng cho API (đầu Phần 9). PostgreSQL heap: PK không “dính” mọi secondary như clustered — vẫn nên BIGINT/`IDENTITY` cho join; UUID random chỉ làm **index UUID** phân mảnh, không xé cả bảng.
+
+### Multi-tenant: `tenant_id` đứng đầu schema
+
+SaaS: gần như mọi câu đều `WHERE tenant_id = @t`. Cột đó phải **equality trái** (nguyên tắc 3), trên PK/index và thường trên FK.
+
+```sql
+CREATE TABLE orders (
+  tenant_id   INT NOT NULL,
+  id          BIGINT GENERATED ALWAYS AS IDENTITY,
+  customer_id BIGINT NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE INDEX orders_customer
+ON orders (tenant_id, customer_id, created_at DESC);
+```
+
+Thiếu `tenant_id` trên index = Seek theo `customer_id` xuyên tenant, hoặc RLS/filter thêm sau. PostgreSQL: `ENABLE ROW LEVEL SECURITY` + policy `tenant_id = current_setting(...)` — **vẫn** cần index `(tenant_id, …)`; RLS không thay Seek. SQL Server: tương tự predicate trong view/proc, không phải “máy tự hiểu tenant”.
+
+### Status: ENUM, lookup, hay VARCHAR
+
+- **VARCHAR + `CHECK`**: đổi giá trị = migration data, không lock catalog kiểu enum. Index B-tree bình thường. Selectivity thấp → partial/filtered (Phần 6).
+- **Lookup table** (`status_id` FK): thêm trạng thái không `ALTER TYPE`. Index FK (Phần 10). JOIN nhỏ, covering được.
+- **ENUM (PostgreSQL)**: compact, nhưng `ALTER TYPE … ADD VALUE` hạn chế trong transaction; xóa/đổi label đau. MySQL enum = string ngầm, reorder giá trị dễ vỡ sort.
+
+Không tạo index **chỉ** trên `status` nếu `open` chiếm 40% bảng. Kết hợp `(tenant_id, status, created_at)` hoặc `WHERE status = 'open'`.
+
+### Bảng nối nhiều-nhiều: PK kép thay `id` thừa
+
+```sql
+-- ❌ id vô nghĩa + unique muộn: hai row (1,2) lọt nếu quên unique
+CREATE TABLE user_roles (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL,
+  role_id INT NOT NULL
+);
+
+-- ✅ PK = chính cặp; Seek theo user
+CREATE TABLE user_roles (
+  user_id INT NOT NULL,
+  role_id INT NOT NULL,
+  PRIMARY KEY (user_id, role_id),
+  FOREIGN KEY (user_id) REFERENCES users (id),
+  FOREIGN KEY (role_id) REFERENCES roles (id)
+);
+CREATE INDEX user_roles_role ON user_roles (role_id, user_id);  -- chiều ngược + covering
+```
+
+`id` trên bảng nối chỉ cần khi chính row đó bị FK từ chỗ khác. Index một chiều không đủ cho “mọi user của role X”.
+
+### Thời gian: `timestamptz`, không `TIMESTAMP without time zone`
+
+`TIMESTAMP` / `DATETIME` không timezone = “3 giờ” không biết 3 giờ ở đâu. App UTC, DB local, DST → lệch index range (`created_at >= …`).
+
+| Hệ | Kiểu nên dùng cho “mốc thời điểm” |
+| -- | --------------------------------- |
+| PostgreSQL | `TIMESTAMPTZ` (`timestamp with time zone`) — lưu UTC, hiện theo session |
+| SQL Server | `DATETIME2` + quy ước UTC, hoặc `DATETIMEOFFSET` nếu cần offset gốc |
+| MySQL | `DATETIME` (naive) hoặc `TIMESTAMP` (convert theo `time_zone`) — **đừng trộn** |
+
+Range luôn nửa-mở, không hàm trên cột (Phần 4):
+
+```sql
+WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00+07'
+  AND created_at <  TIMESTAMPTZ '2025-01-01 00:00+07'
+```
+
+Cột “ngày sinh / ngày hóa đơn theo lịch” (không phải mốc tuyệt đối) mới dùng `DATE` / naive datetime.
+
+## Phần 10. Checklist & lỗ hổng hay quên
+
+Những điểm dưới đây hay bị bỏ khi tối ưu index — không thay thế các phần trên, chỉ là lưới an toàn trước khi merge.
+
+### Luôn index khóa ngoại
+
+`JOIN` / `ON DELETE` / `ON UPDATE` đi theo FK. Không index cột FK → Nested Loop / Key Lookup hàng loạt, hoặc lock scan cả bảng khi xóa parent.
+
+```sql
+-- orders.customer_id REFERENCES customers(id)
+CREATE INDEX orders_customer_id ON orders (customer_id);
+```
+
+Composite hay dùng: `(customer_id, created_at DESC)` nếu list đơn theo khách + thời gian.
+
+### Đừng `SELECT *` nếu muốn covering
+
+Covering / Index Only Scan chỉ xảy ra khi **mọi cột** trong query nằm trong index (key + `INCLUDE` / PK InnoDB). `SELECT *` phá covering ngay khi bảng có cột “mỡ”. Lấy đúng cột cần.
+
+### HOT update (PostgreSQL) và “cột không nằm trong index”
+
+Phần 1 nói: update cột không thuộc index thì index không đổi. Trên PostgreSQL, nếu **không** đụng cột indexed và còn chỗ trên page, update có thể là **HOT** (Heap-Only Tuple) — không đụng secondary index. Index “thừa” trên cột hay bị sửa (status, updated_at, counter) giết HOT → write chậm hơn bạn nghĩ.
+
+### BRIN / columnstore cho dữ liệu append-only
+
+B-tree không phải câu trả lời duy nhất:
+
+| Tình huống | Công cụ |
+| ---------- | ------- |
+| Time-series / log, insert cuối bảng, query theo khoảng thời gian | PostgreSQL **BRIN** trên `created_at` (rẻ, nhỏ) |
+| Analytics, scan vài cột trên bảng rất rộng | SQL Server **columnstore** (clustered/nonclustered) |
+| Equality thuần, không range | PostgreSQL `USING HASH` (PG 10+ đã WAL-safe) — vẫn không thay B-tree cho `ORDER BY` / range |
+
+### Thống kê, histogram, và “index có mà không Seek”
+
+Optimizer **đoán** cardinality. Thống kê cũ sau bulk load = plan sai (Phần 5). SQL Server: xem histogram `DBCC SHOW_STATISTICS`. PostgreSQL: `pg_stats`, `ANALYZE`. MySQL: histogram 8.0 (`ANALYZE TABLE ... UPDATE HISTOGRAM`).
+
+### Invisible / disable trước khi DROP
+
+Nhắc lại: MySQL `INVISIBLE`, SQL Server `DISABLE`, PostgreSQL không có — test staging. `idx_scan = 0` sau restart không có nghĩa là index vô dụng (PG stat reset; SQL Server `dm_db_index_usage_stats` mất khi instance restart nếu không persist).
+
+### Trước khi `CREATE INDEX`
+
+1. Query chậm thật sự đọc bao nhiêu row? (`EXPLAIN ANALYZE` / Actual Plan)
+2. Cột equality trái → range → sort/`INCLUDE` (bốn nguyên tắc)
+3. Đã có prefix trùng chưa? (index thừa)
+4. Online / `CONCURRENTLY` trên production
+5. FK đã có index chưa?
+6. Write path: bảng này insert/update thế nào? thêm index có giết HOT / page split PK random không?
+
+Xong checklist này rồi hãy deploy index.
+
+## Bonus. Hiểu sâu B+ Tree trong RDBMS
+
+Phần 1 đủ để thiết kế index. Phần này giải thích *cơ chế* — đọc khi cần hiểu page split, random UUID, covering, và vì sao range chỉ đi một hướng (nguyên tắc 2).
+
+Engine B-tree của PostgreSQL / SQL Server / InnoDB đều là **B+ Tree** (hoặc biến thể): dữ liệu hàng nằm ở **lá**, tầng trên chỉ là chìa khóa dẫn đường. (PostgreSQL gọi access method `btree`; bên trong vẫn là B+.)
+
+### B-tree vs B+ Tree: data chỉ nằm ở lá
+
+B-tree cổ điển có thể cất record ở **mọi** tầng. B+ Tree:
+
+- **Internal (nhánh):** separator keys + pointer xuống con. Không đủ cột để trả query.
+- **Leaf (lá):** mọi key, theo thứ tự, trỏ ra row (hoặc chứa luôn clustered row).
+
+```
+          [  50  |  120  ]                    ← internal (chỉ “ngã rẽ”)
+          /      |       \
+    [..50)   [50..120)   [120..]              ← lá: key đã sort + con trỏ row
+     ←prev───────────────next→                ← lá móc đôi
+```
+
+Hệ quả: Seek = vài lần đọc nhánh (thường trong buffer) rồi **một** lần đọc lá. Range = Seek lá trái + đi `next` — không nhảy lung tung trên cây. Đó là nguyên tắc 2.
+
+### Page, fanout, chiều cao cây
+
+Index không lưu từng byte một file phẳng. Đơn vị I/O là **page** (PostgreSQL mặc định 8 KB, SQL Server 8 KB, InnoDB 16 KB thường gặp).
+
+Một page nhánh chứa hàng trăm separator → **fanout** (số con mỗi node) ~ 100–500 tùy độ rộng key. Chiều cao:
+
+| Số row (lá ~300 key/page) | Chiều cao (xấp xỉ) |
+| ------------------------- | ------------------ |
+| 300                       | 1 (gần như chỉ lá) |
+| 90.000                    | 2                  |
+| 27 triệu                  | 3                  |
+| 8 tỷ                      | 4                  |
+
+Tỷ row vẫn 3–4 hop. Seek đắt vì **lá + heap/clustered lookup**, không vì “cây quá cao”. Key càng rộng (UUID, `VARCHAR(500)`) fanout càng nhỏ → cao hơn một chút, cache kém hơn. **Thu hẹp key** (Phần 9) chính là tăng fanout.
+
+Root + tầng trên gần như luôn trong shared buffers / buffer pool. Random insert đau ở **lá** (và data page), không ở việc “đi hết chiều cao”.
+
+### Lá nối nhau: Vì sao range chỉ đi một hướng
+
+Lá là danh sách móc **hai chiều** (`prev` / `next`). `BETWEEN` / `LIKE 'abc%'` / `ORDER BY key`:
+
+1. Xuống cây tới lá chứa cận trái  
+2. Đọc tuần tự lá → lá kế, **một hướng**
+
+Không có “đi tới vừa lùi” trong một lần duyệt. `ORDER BY score DESC, created_at ASC` trên một index `(score, created_at)` cùng chiều → nguyên tắc 2 gãy. `!=` nằm hai phía key → không phải một range (Phần 4).
+
+InnoDB / SQL Server clustered: **bảng** cũng là B+ Tree — range trên PK là scan lá clustered, sequential theo key, không theo thời điểm insert (trừ khi PK tăng dần).
+
+### Page split: Random insert đắt hơn sequential
+
+Lá đầy mà phải chèn key nằm giữa → **split**: một page thành hai, ~một nửa key sang page mới, sửa pointer tầng trên (đôi khi split lan lên root).
+
+```
+Lá đầy:  [10|20|30|40|50|60|70|80]
+Insert 45 → split
+         [10|20|30|40|45]  [50|60|70|80]
+                ↑ page mới, I/O + fragment
+```
+
+- **Sequential** (`IDENTITY`, UUIDv7): insert cuối lá phải, split ít, page mới append — cache thân thiện.  
+- **Random** (UUIDv4, hash): split giữa, page nửa đầy rải disk → fragmentation (Phần 6 REINDEX / `REBUILD`).
+
+SQL Server: `page_split` trong `sys.dm_db_index_operational_stats`. PostgreSQL: ít counter “split” lộ; nhìn bloat / `pg_stat_all_indexes`. Fillfactor (dưới) giảm split cho update-at-the-key.
+
+### Leaf chứa gì: TID (heap) vs clustered key
+
+Sau khi Seek tới lá, engine phải ra **row**:
+
+| | PostgreSQL (heap mặc định) | SQL Server clustered / InnoDB |
+| --- | --- | --- |
+| Secondary leaf | key + **TID** (`ctid`: file/block/offset) | key + **clustered key** (thường PK) |
+| Bước tiếp | Heap fetch theo TID (có thể random I/O) | Seek thêm trên cây clustered bằng PK |
+
+Covering / Index Only Scan: đủ cột trên lá → **bỏ** heap fetch. Visibility map (PG) / không lookup (SQL Server) mới “only”. `SELECT *` phá (Phần 10).
+
+Heap: update không đổi cột index → TID có thể giữ (HOT). Clustered: đổi PK = di chuyển row + sửa **mọi** secondary (vì chúng lưu PK). Đổi PK production = thảm họa có chủ đích.
+
+Nonclustered SQL Server / InnoDB secondary: leaf **không** có toàn bộ cột bảng — trừ `INCLUDE` / cột nằm trong clustered key. Đó là lý do clustered key hẹp (Phần 9).
+
+### Fillfactor: Chỗ trống cố ý
+
+Tạo index có thể để **trống cố ý** trên lá, dành cho insert/update sau này, giảm split.
+
+```sql
+-- PostgreSQL: 100 = đầy lá (tốt cho append-only / read-mostly)
+CREATE INDEX orders_created_at ON orders (created_at)
+WITH (fillfactor = 90);
+
+-- SQL Server
+CREATE INDEX orders_created_at ON orders (created_at)
+WITH (FILLFACTOR = 90);
+```
+
+- **100 / 100:** bảng log, PK tăng, ít update key → mật độ tối đa, scan ít page.  
+- **70–90:** update tại chỗ / insert “gần random” trên secondary.  
+- PostgreSQL `fillfactor` cũng ảnh hưởng **heap** (`ALTER TABLE … SET (fillfactor = 80)`) — chỗ cho HOT. SQL Server fillfactor chủ yếu **index**; heap khác (forwarding records).
+
+Không phải núm vặn query. Sai fillfactor = lãng phí RAM hoặc split như random UUID. Đo fragmentation / bloat rồi mới hạ.
+
+### Khi nào không dùng B+ Tree
+
+B+ Tree thắng khi có **thứ tự**: equality, range, `ORDER BY`, prefix `LIKE`. Không phải mọi index đều B+ Tree:
+
+| Nhu cầu | Cấu trúc | Hệ |
+| ------- | -------- | --- |
+| Equality thuần, không range / sort | Hash | PostgreSQL `USING HASH`; SQL Server hash chỉ memory-optimized |
+| Full-text, JSON containment, array | GIN | PostgreSQL |
+| Hình học, range overlap, exclusion | GiST / SP-GiST | PostgreSQL (Phần 6, 9) |
+| Time-series append, query theo khoảng thô | BRIN | PostgreSQL (Phần 10) |
+| Scan vài cột, bảng rất rộng | Columnstore | SQL Server (Phần 10) |
+| `LIKE '%abc%'` | Trigram GIN / FULLTEXT | Phần 6 |
+
+Default `CREATE INDEX` = B+ Tree. Đừng đổi sang hash/GIN vì “nghe nhanh hơn” khi query vẫn là `WHERE ts BETWEEN … ORDER BY ts`.
+
+---
+
+Bốn nguyên tắc (Phần 2) là hệ quả của B+ Tree: Seek xuống lá, scan một hướng, phễu trái→phải vì key ghép sort như từ điển, range cắt phễu vì lá không “nhảy cóc” cột sau. Hiểu page và leaf xong, quay lại thiết kế index — đừng tối ưu fanout trước khi query đúng nguyên tắc.
