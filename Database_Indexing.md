@@ -26,6 +26,10 @@
   - [JOIN](#join-phân-tách-và-kết-hợp)
   - [Subquery](#subquery-không-chậm-như-bạn-nghĩ)
   - [UPDATE & DELETE](#update--delete-đừng-quên-tối-ưu-cho-chúng)
+  - [IN](#in-nhiều-equality-không-phải-range)
+  - [HAVING](#having-không-thay-được-where)
+  - [UNION / UNION ALL](#union-và-union-all-mỗi-nhánh-một-index)
+  - [Window function](#window-function-partition--order-cũng-cần-index)
 - [Phần 5. Tại sao Database không dùng Index](#phần-5-tại-sao-database-không-dùng-index-của-tôi)
   - [Quy trình thực thi](#quy-trình-thực-thi-query-bên-trong-bộ-não-của-database)
   - [Index không khớp](#index-không-khớp-với-query-lý-do-phổ-biến-nhất)
@@ -33,6 +37,11 @@
   - [Chọn index khác](#database-chọn-index-khác-khi-có-nhiều-lựa-chọn)
   - [Parameter sniffing](#parameter-sniffing-plan-đúng-với-lần-chạy-đầu-sai-với-lần-sau)
   - [Tạo index không khóa bảng](#tạo-và-bảo-trì-index-mà-không-khóa-bảng)
+  - [Seek rồi Filter](#seek-rồi-filter-index-dùng-mà-vẫn-chậm)
+  - [Key Lookup](#key-lookup--heap-fetch-khi-seek-thua-scan)
+  - [Partial / filtered index](#partial--filtered-index-không-khớp-predicate)
+  - [Thống kê lệch](#thống-kê-lệch-và-cột-tương-quan)
+  - [View bọc cột](#view-và-hàm-bọc-cột-index-có-mà-optimizer-mù)
 - [Phần 6. Cạm bẫy và mẹo nâng cao](#phần-6-cạm-bẫy-và-mẹo-nâng-cao-về-indexing)
   - [Index trên biểu thức](#index-trên-biểu-thức-khi-không-thể-viết-lại-query)
   - [Cột ít giá trị](#cột-giá-trị-ít-boolean-trạng-thái-khi-index-trở-nên-vô-nghĩa)
@@ -65,6 +74,11 @@
   - [LATERAL / APPLY](#lateral--cross-apply-top-n-mỗi-nhóm)
   - [CTE](#biểu-thức-bảng-tạm-cte-xử-lý-query-phức-tạp)
   - [Tips khác](#các-tips-query-hữu-ích-khác)
+  - [N+1](#n1-vòng-lặp-query-vs-một-câu-sql)
+  - [Optional filter](#optional-filter-or-is-null-phá-index)
+  - [LEFT JOIN IS NULL](#left-join--is-null-anti-join-dễ-viết-sai)
+  - [COUNT lớn](#count-lớn-đừng-đếm-cả-bảng-mỗi-request)
+  - [Khoảng nửa-mở](#khoảng-thời-gian-nửa-mở)
 - [Phần 9. Thiết kế Schema](#phần-9-thiết-kế-schema-nền-móng-vững-chắc)
   - [UUID vs Auto-increment](#uuid-vs-auto-increment-lựa-chọn-primary-key)
   - [JSON column](#json-column-khi-nosql-gặp-sql)
@@ -1025,7 +1039,74 @@ SELECT * FROM logs WHERE created_at < '2024-01-01';
 -- Nếu SELECT chậm → DELETE cũng chậm → cần index trên (created_at)
 ```
 
+`UPDATE` cột nằm trong index = xóa entry cũ + chèn entry mới (page split, giết HOT — Phần 10). `UPDATE` 1 triệu row theo điều kiện hẹp: index cho **mệnh đề WHERE**, không phải cho cột đang gán.
 
+### IN: Nhiều equality, không phải range
+
+`IN ('a','b','c')` = vài nhánh **equality** (nguyên tắc 1), không phải range (nguyên tắc 4). Optimizer thường Bitmap/Index Union vài Seek.
+
+```sql
+-- ✅ Index (status) hoặc (shop_id, status)
+WHERE shop_id = 42 AND status IN ('paid', 'refunded', 'cancelled');
+```
+
+- `NOT IN (...)` giống `!=`: hai phía + bẫy `NULL` (Phần 4 NULL). `NOT EXISTS` an toàn hơn (Phần 8).
+- `IN` vài nghìn literal: parse/plan phình, cardinality đoán mò. Nhét staging table + `JOIN` (có index) thường ổn hơn.
+- `IN (SELECT …)`: index bảng trong subquery (cột so sánh). Không phải lúc nào cũng kém JOIN — xem plan.
+
+`= ANY(ARRAY[...])` (PostgreSQL) cùng họ với `IN`.
+
+### HAVING: Không thay được WHERE
+
+`WHERE` lọc **row** (trước GROUP BY) → index theo nguyên tắc 3–4. `HAVING` lọc **nhóm đã gộp** — không Seek vào từng row.
+
+```sql
+-- ❌ filter row nhét HAVING: GROUP BY xong mới bỏ, index WHERE không giúp
+SELECT shop_id, COUNT(*)
+FROM orders
+GROUP BY shop_id
+HAVING shop_id = 42;
+
+-- ✅ WHERE trước, HAVING chỉ cho aggregate
+SELECT shop_id, COUNT(*)
+FROM orders
+WHERE shop_id = 42
+GROUP BY shop_id
+HAVING COUNT(*) > 100;
+```
+
+Index cho câu dưới: `(shop_id)` đủ đếm; list nhóm “nặng” toàn bảng: `(shop_id)` vẫn scan index — đừng kỳ vọng Seek 1 shop nếu không có `WHERE`.
+
+### UNION và UNION ALL: Mỗi nhánh một index
+
+Mỗi `SELECT` trong `UNION` là query riêng — index **từng nhánh**, không có “một index cho cả UNION”.
+
+```sql
+SELECT id FROM users WHERE email = @e
+UNION ALL
+SELECT id FROM users WHERE phone = @p;
+-- Index (email), index (phone) — xem Phần 6 (OR hai cột)
+```
+
+`UNION` (không `ALL`) = cộng rồi **loại trùng** (sort/hash) → đắt. Trùng không thể xảy ra thì `UNION ALL`. `OR` một câu vs `UNION ALL` hai Seek: khi hai cột khác index, `UNION ALL` thường thắng (Phần 6).
+
+### Window function: Partition + Order cũng cần index
+
+`ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC)` cần sort/partition giống `GROUP BY` + `ORDER BY`. Index `(customer_id, created_at DESC)` cho phép đọc đã thứ tự — tránh WindowAggregate + Sort.
+
+```sql
+-- Top 1 đơn mỗi khách: window hoặc LATERAL (Phần 8)
+SELECT *
+FROM (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY customer_id ORDER BY created_at DESC
+  ) AS rn
+  FROM orders
+) t
+WHERE rn = 1;
+```
+
+Filter `WHERE created_at >= …` **trước** window thì đưa `created_at` vào index đúng chỗ (equality/range trái). `WHERE rn = 1` **không** đẩy xuống index — đó là filter sau cửa sổ. Top-N mỗi nhóm trên nhiều khách: `LATERAL` / `APPLY` + Seek từng nhóm đôi khi rẻ hơn window sort cả bảng (Phần 8).
 
 ## Phần 5. Tại sao Database không dùng Index của tôi
 
@@ -1185,7 +1266,82 @@ CREATE INDEX idx_orders_status ON orders (status);
 -- ALGORITHM=INPLACE, LOCK=NONE khi engine hỗ trợ
 ```
 
+### Seek rồi Filter: Index dùng mà vẫn chậm
 
+Plan có **Seek** không có nghĩa là predicate đã được đẩy hết vào index. Optimizer Seek theo prefix khớp, rồi **Filter** phần còn lại trên từng row (residual predicate).
+
+```sql
+-- Index (shop_id, created_at)
+WHERE shop_id = 42
+  AND EXTRACT(YEAR FROM created_at) = 2024;  -- không SARGable
+```
+
+Seek `shop_id = 42` (đúng), rồi lọc từng đơn 2024 bằng hàm — shop lớn = đọc hàng trăm nghìn leaf. Plan: Index Seek + Filter. Viết lại range trên cột (mục trên) hoặc expression index (Phần 6).
+
+Nhìn plan: **Filter** / `Recheck Cond` / predicate không nằm trong Seek keys. SQL Server: Seek keys vs Residual. PostgreSQL: `Index Cond` vs `Filter`.
+
+### Key Lookup / heap fetch: Khi Seek thua Scan
+
+Nonclustered Seek rồi **Key Lookup** (SQL Server) / heap fetch (PostgreSQL) cho mỗi row vì `SELECT *` hoặc cột ngoài index. Vài chục lookup ổn; vài trăm nghìn lookup = random I/O thảm — optimizer **đúng** khi chọn Clustered/Seq Scan.
+
+```sql
+-- Index (status) không covering
+SELECT * FROM orders WHERE status = 'pending';
+```
+
+`pending` 2% bảng: Seek + lookup. `pending` 40%: scan. Sửa: covering / `INCLUDE` (Phần 6), hoặc bớt cột SELECT (Phần 10). Đừng `WITH (INDEX=…)` / `pg_hint_plan` ép Seek khi lookup đắt hơn scan.
+
+### Partial / filtered index không khớp predicate
+
+Index “một phần bảng” chỉ dùng khi query có **đúng** (hoặc chặt hơn) predicate lúc tạo:
+
+```sql
+CREATE INDEX orders_open_created ON orders (created_at)
+WHERE status = 'open';   -- PostgreSQL partial / SQL Server filtered
+```
+
+| Query | Dùng được? |
+| ----- | ---------- |
+| `WHERE status = 'open' AND created_at > …` | Có |
+| `WHERE created_at > …` (không ghi status) | Không |
+| `WHERE status = @status` (SQL Server parameter) | **Thường không** — optimizer không dám giả định `@status` luôn `'open'` |
+
+SQL Server: literal `'open'` hoặc `OPTION (RECOMPILE)` / dynamic SQL với giá trị cụ thể. PostgreSQL custom plan thường ổn hơn với parameter. Predicate lệch một chút (`status IN ('open','paused')`) cũng **không** dùng index `WHERE status = 'open'`.
+
+### Thống kê lệch và cột tương quan
+
+Optimizer nhân selectivity **độc lập**: `city = 'HCM' AND zip = '700000'` tưởng 1% × 1% = 0.01%, thực tế zip gần như suy ra city → ước lượng sai → chọn index/scan ngược.
+
+Sau bulk load, histogram cũ = “index có mà không Seek” (Phần 10).
+
+```sql
+-- PostgreSQL 10+: extended statistics
+CREATE STATISTICS orders_city_zip ON city, zip FROM orders;
+ANALYZE orders;
+
+-- SQL Server: stats nhiều cột (tạo index composite cũng tạo stats)
+CREATE STATISTICS orders_city_zip ON orders (city, zip);
+UPDATE STATISTICS orders WITH FULLSCAN;
+```
+
+`EXPLAIN` lệch `rows` ước lượng vs `actual` một–hai bậc 10 → thống kê / correlation / sniffing, chưa chắc thiếu index (Phần 3).
+
+### View và hàm bọc cột: Index “có” mà optimizer mù
+
+Index nằm trên **bảng**, không phải trên tên view. View `CREATE VIEW v AS SELECT *, LOWER(email) AS email_lc` rồi `WHERE email_lc = …` = hàm trên cột (mục Index không khớp). Scalar UDF trong `WHERE` (SQL Server) thường **chặn** Seek — inline / viết lại.
+
+```sql
+-- ❌ view giấu hàm
+CREATE VIEW v_users AS
+SELECT id, LOWER(email) AS email FROM users;
+SELECT * FROM v_users WHERE email = 'a@b.com';  -- không dùng index (email)
+
+-- ✅ predicate trên cột gốc, hoặc expression index (Phần 6)
+SELECT * FROM users WHERE email = 'a@b.com';
+-- hoặc WHERE LOWER(email) = ... + index (LOWER(email))
+```
+
+Indexed view / materialized view là chuyện khác (SQL Server indexed view, PostgreSQL `MATERIALIZED VIEW`) — phải `REFRESH` / maintenance, không phải SELECT view thường.
 
 ## Phần 6. Cạm bẫy và mẹo nâng cao về Indexing
 
@@ -1963,7 +2119,76 @@ SELECT * FROM (
 ) t WHERE rn = 1;
 ```
 
+### N+1: Vòng lặp query vs một câu SQL
 
+ORM/`foreach` khách rồi `SELECT * FROM orders WHERE customer_id = @id` = N+1 round-trip. Index `(customer_id)` **không** cứu latency mạng.
+
+```sql
+-- 1 round-trip: IN / JOIN / LATERAL (Phần 8 trên)
+SELECT * FROM orders
+WHERE customer_id = ANY(@ids);          -- PostgreSQL
+-- SQL Server: WHERE customer_id IN (SELECT id FROM @ids)
+
+-- Chi tiết sau khi có id: hai bước (covering hẹp rồi hydrate)
+SELECT id FROM orders WHERE customer_id = @c AND created_at >= @from ORDER BY created_at DESC LIMIT 50;
+SELECT * FROM orders WHERE id = ANY(@page_ids);
+```
+
+Bước 1: index hẹp `(customer_id, created_at DESC) INCLUDE (id)` — Index Only. Bước 2: PK Seek 50 row. `SELECT *` một phát trên 50k đơn = lookup nổ (Phần 5).
+
+### Optional filter: `OR col IS NULL` / `@p IS NULL OR col = @p`
+
+Form search “mọi field tùy chọn”:
+
+```sql
+-- ❌ phá Seek: optimizer không đẩy @status vào index (status)
+WHERE (@status IS NULL OR status = @status)
+  AND (@from  IS NULL OR created_at >= @from);
+```
+
+SQL Server hay scan; PostgreSQL generic plan cũng dễ bỏ index. Cách làm:
+
+1. **Dynamic SQL** / query builder: chỉ `AND` khi user chọn filter — mỗi combo một plan, SARGable.
+2. SQL Server: `OPTION (RECOMPILE)` cho báo cáo thưa (compile mỗi lần).
+3. Hai query: “có filter” vs “không filter”, không nhét một câu catch-all.
+
+`COALESCE(@status, status) = status` cùng họ — hàm/`OR` trên cột, không Seek.
+
+### LEFT JOIN … IS NULL: Anti-join dễ viết sai
+
+`NOT EXISTS` (trên) là anti-join chuẩn. Người ta hay viết:
+
+```sql
+SELECT c.id
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+```
+
+Đúng nghĩa “không có đơn” **chỉ khi** `ON` đủ khóa, `WHERE` lọc phía phải `IS NULL`. Lỡ `AND o.created_at >= @d` viết vào `WHERE` thay vì `ON` → mọi khách không đơn 2024 bị loại luôn (inner join ngầm). `COUNT(o.id) = 0` sau `GROUP BY` cũng anti-join — thường nặng hơn `NOT EXISTS`. Plan: Anti Join + Seek `(customer_id)` trên orders; nếu Hash cả bảng, thiếu index FK.
+
+### COUNT lớn: Đừng đếm cả bảng mỗi request
+
+`SELECT COUNT(*) FROM orders` = scan (index-only nếu có index hẹp, vẫn O(n)). Dashboard mỗi request = đắt.
+
+- Ước lượng: PostgreSQL `reltuples` (`pg_class`); SQL Server `sys.dm_db_partition_stats` / `sp_spaceused`.
+- Đếm theo điều kiện hẹp: index khớp phễu, covering không cần `*`.
+- Số liệu “đủ gần”: counter table (Phần 7 fan-out) hoặc materialized (Phần 9).
+- `COUNT(col)` bỏ NULL — không nhanh hơn `COUNT(*)` nếu không covering cột đó.
+
+UI “1.2 triệu đơn” không cần đúng từng row: làm tròn + cache.
+
+### Khoảng thời gian nửa-mở
+
+`BETWEEN @from AND @to` **bao gồm** hai đầu. `DATETIME`/`timestamptz` cuối ngày `23:59:59` bỏ sót hoặc trùng trang.
+
+```sql
+-- ✅ [from, to)
+WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00+07'
+  AND created_at <  TIMESTAMPTZ '2024-02-01 00:00+07'
+```
+
+Keyset pagination cùng cột thời gian: cursor `created_at, id`, so sánh bậc thang (đầu Phần 8) — `BETWEEN` + `OFFSET` vừa trùng vừa nhảy trang. Không `DATE(created_at)` / `CAST(created_at AS date)` (Phần 5). Timezone: Phần 9.
 
 ## Phần 9. Thiết kế Schema: Nền móng vững chắc
 
