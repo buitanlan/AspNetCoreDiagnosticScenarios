@@ -1,4 +1,4 @@
-# Database Indexing — Những điều developer cần biết
+# Database Indexing
 
 ## Mục lục
 
