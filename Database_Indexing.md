@@ -73,6 +73,7 @@
   - [EXISTS / NOT EXISTS](#exists-và-not-exists-semi-join--anti-join)
   - [LATERAL / APPLY](#lateral--cross-apply-top-n-mỗi-nhóm)
   - [CTE](#biểu-thức-bảng-tạm-cte-xử-lý-query-phức-tạp)
+  - [Bảng tạm và bảng biến](#bảng-tạm-temp-và-bảng-biến-table-sql-server)
   - [Tips khác](#các-tips-query-hữu-ích-khác)
   - [N+1](#n1-vòng-lặp-query-vs-một-câu-sql)
   - [Optional filter](#optional-filter-or-is-null-phá-index)
@@ -2066,7 +2067,7 @@ Chỉ rẻ khi **số nhóm nhỏ** (hoặc đã filter khách) và index `(cust
 
 Chia query thành bước nhỏ, mỗi CTE test độc lập — dễ debug hơn subquery lồng.
 
-CTE **không** phải bảng tạm trên đĩa. PostgreSQL (đến 11 inlined; 12+ có thể materialize): CTE bị đọc nhiều lần hoặc tối ưu kém hơn subquery. Ép: `AS MATERIALIZED` / `NOT MATERIALIZED` (PG 12+). SQL Server: CTE thường inlined; spool khi recursive hoặc optimizer chọn spool.
+CTE **không** phải bảng tạm trên đĩa. PostgreSQL (đến 11 inlined; 12+ có thể materialize): CTE bị đọc nhiều lần hoặc tối ưu kém hơn subquery. Ép: `AS MATERIALIZED` / `NOT MATERIALIZED` (PG 12+). SQL Server: CTE thường inlined; spool khi recursive hoặc optimizer chọn spool. Cần index trên tập trung gian thì dùng [bảng tạm và bảng biến](#bảng-tạm-temp-và-bảng-biến-table-sql-server).
 
 ```sql
 -- Recursive: cây category (cần index parent_id)
@@ -2086,6 +2087,48 @@ SELECT * FROM tree;
 ```
 
 Cây sâu / graph: materialized path (Phần 9) thường rẻ hơn recursive trên mọi request.
+
+### Bảng tạm `#temp` và bảng biến `@table` (SQL Server)
+
+CTE không nhận `CREATE INDEX`. Khi tập trung gian của SQL Server cần index, dùng bảng tạm hoặc bảng biến. Cả hai nằm trong **tempdb** (bảng biến không "chỉ ở RAM").
+
+| | `#orders` bảng tạm | `@orders` bảng biến |
+| --- | --- | --- |
+| Index | Clustered và nonclustered, thêm lúc nào cũng được | Chỉ khai báo trong `DECLARE` (SQL Server 2014+). Không `CREATE INDEX` sau |
+| Thống kê | Histogram, tự cập nhật, có thể recompile | Không histogram. Compatibility 150+ (SQL Server 2019) biết **số dòng** lúc biên dịch lần đầu, vẫn không biết phân bố cột |
+| Transaction | `ROLLBACK` hủy luôn dòng đã ghi | `ROLLBACK` **không** xóa dữ liệu trong `@table` |
+| Phạm vi | Session; procedure con nhìn thấy | Batch / procedure hiện tại; procedure con không thấy |
+| DDL | `CREATE INDEX`, `ALTER`, `TRUNCATE` | Không `ALTER`, không `TRUNCATE` (dùng `DELETE`) |
+
+```sql
+-- Bảng tạm: clustered (PK) + nonclustered
+CREATE TABLE #orders (
+  id bigint NOT NULL PRIMARY KEY,       -- clustered
+  customer_id int NOT NULL,
+  created_at datetime2 NOT NULL
+);
+CREATE INDEX ix_orders_customer
+  ON #orders (customer_id, created_at DESC);
+
+-- Nạp xong rồi mới đánh index: insert vào heap nhanh hơn, index build một lần
+-- CREATE INDEX ix_orders_customer ON #orders (customer_id, created_at DESC);
+
+-- Bảng biến: index phải nằm trong DECLARE
+DECLARE @orders TABLE (
+  id bigint NOT NULL PRIMARY KEY CLUSTERED,
+  customer_id int NOT NULL,
+  created_at datetime2 NOT NULL,
+  INDEX ix_orders_customer NONCLUSTERED (customer_id, created_at DESC)
+);
+```
+
+`#temp` khi tập lớn, join nhiều, hoặc cần vài cách lọc. `@table` khi vài chục đến vài trăm dòng và plan không phụ thuộc histogram. Join `@table` lớn với bảng thật: optimizer đoán sai → Nested Loop nổ. Đổi sang `#temp` rồi để thống kê cập nhật.
+
+`##orders` là bảng tạm global: session khác thấy được, xóa khi session tạo nó kết thúc và không còn ai dùng. Hiếm khi cần.
+
+Sort spill / Index Spool trong plan cũng dùng `tempdb`, nhưng đó là cấu trúc optimizer tự dựng cho một câu query. Không phải `#temp` hay `@table` của bạn.
+
+PostgreSQL không có bảng biến. Tập trung gian có index: `CREATE TEMP TABLE` rồi `CREATE INDEX`, và `ANALYZE` bảng đó (autovacuum không đụng temp table).
 
 ### Các tips query hữu ích khác
 
