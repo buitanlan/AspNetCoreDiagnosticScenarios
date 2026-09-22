@@ -274,9 +274,9 @@ Với 50 bảng tương tự: chênh lệch 4.5 GB
 
 Thực tiễn: auto-increment integer hoặc UUIDv7/ULID (binary, không phải string) là lựa chọn an toàn nhất.
 
-- **PostgreSQL:** `BIGINT GENERATED ALWAYS AS IDENTITY` hoặc UUIDv7 kiểu `UUID` (16 bytes), không lưu `CHAR(36)`.
-- **SQL Server:** `BIGINT IDENTITY` hoặc `UNIQUEIDENTIFIER` với `NEWSEQUENTIALID()` / UUIDv7. Tránh `NEWID()` trên clustered PK. Đừng lưu UUID dạng `CHAR(36)` / `NVARCHAR(36)`.
-- **MySQL:** `BIGINT AUTO_INCREMENT` hoặc ULID/UUIDv7 dạng `BINARY(16)`, không dùng `CHAR(36)`.
+- **PostgreSQL:** `BIGINT GENERATED ALWAYS AS IDENTITY`, hoặc UUIDv7 (`uuidv7()`, PostgreSQL 18+, 16 bytes). `gen_random_uuid()` là v4 — random, làm page split. Không lưu `CHAR(36)`.
+- **SQL Server:** `BIGINT IDENTITY` hoặc `UNIQUEIDENTIFIER` + `NEWSEQUENTIALID()` (GUID tăng dần, không phải RFC UUIDv7). UUIDv7 sinh ở app rồi ghi `UNIQUEIDENTIFIER`. Tránh `NEWID()` trên clustered PK. Đừng lưu `CHAR(36)` / `NVARCHAR(36)`.
+- **MySQL:** `BIGINT AUTO_INCREMENT` hoặc ULID/UUIDv7 dạng `BINARY(16)` (sinh ở app). `UUID()` là v1; `UUID_TO_BIN(UUID(), 1)` chỉ đảo bit cho gần tuần tự hơn, không phải v7. Không dùng `CHAR(36)`.
 
 
 
@@ -959,11 +959,16 @@ Quy tắc:
 - GROUP BY + WHERE range: range phá vỡ phễu → không loop-and-count được. Giải pháp: biến range thành equality (xem Phần 6)
 - Aggregate (AVG, SUM, MAX): đặt cột aggregate cuối index để index-only
 
-Khi GROUP BY trên primary key, không cần liệt kê các cột khác của cùng bảng:
+Khi `GROUP BY` đúng primary key, **PostgreSQL** và **MySQL** (`ONLY_FULL_GROUP_BY`) cho phép `SELECT` cột khác của cùng bảng (functional dependency):
 
 ```sql
-GROUP BY actors.id;  -- Primary key là đủ!
+SELECT actors.id, actors.name, COUNT(roles.role_id)
+FROM actors
+LEFT JOIN roles ON roles.actor_id = actors.id
+GROUP BY actors.id;  -- PG / MySQL: name suy ra từ PK
 ```
+
+**SQL Server không làm vậy.** Cột không aggregate phải nằm trong `GROUP BY`, kể cả khi đã group theo PK — nếu không sẽ lỗi 8120.
 
 
 
@@ -976,9 +981,16 @@ SELECT employee.* FROM employee
 JOIN department USING (department_id)
 WHERE employee.salary > 100000 AND department.country = 'NR';
 
-CREATE INDEX idx_emp_salary ON employee (salary);
-CREATE INDEX idx_dept ON department (department_id, country);
+-- Lọc country trước (ít phòng ban): Seek country, rồi Seek nhân viên
+CREATE INDEX idx_dept_country ON department (country);
+CREATE INDEX idx_emp_dept_salary ON employee (department_id, salary);
+-- PK department(department_id) đã đủ cho lookup theo id
+
+-- Lọc salary trước: range trên employee, rồi lookup PK department để lọc country
+-- CREATE INDEX idx_emp_salary ON employee (salary) INCLUDE (department_id);
 ```
+
+`(department_id, country)` **không** Seek được `country = 'NR'`: `country` không đứng đầu phễu. `department_id` thường đã là PK.
 
 Thứ tự JOIN trong SQL không phải thứ tự database thực thi. Luôn tạo index hỗ trợ join theo mọi thứ tự có thể. Nên giữ số bảng join dưới 6-8.
 
@@ -1498,6 +1510,8 @@ INCLUDE (price);
 
 Dùng `INCLUDE` khi chỉ cần cột đó để tránh nhảy vào bảng (Index Only Scan / covering), không cần filter hay sort theo cột đó. Đặt cột filter/sort trong key; cột chỉ `SELECT` thì để `INCLUDE`. MySQL: nhét vào key, chấp nhận index to hơn.
 
+PostgreSQL Index Only Scan vẫn **Heap Fetches** nếu visibility map chưa đánh dấu page all-visible (vừa `UPDATE`, chưa `VACUUM`). Plan có covering mà vẫn heap fetch → `VACUUM` / autovacuum, không phải thêm cột. SQL Server không có visibility map: đủ cột trên nonclustered là hết Key Lookup.
+
 ### Lọc và sắp xếp khi JOIN: Bài toán không giải được bằng index
 
 Khi thông tin lọc nằm ở 2 bảng khác nhau, database phải join hàng chục nghìn lần. Đó là tín hiệu **thiết kế lại schema** (denormalize), không phải thêm index.
@@ -1796,7 +1810,7 @@ DELETE FROM sessions
 OUTPUT deleted.id, deleted.user_agent, deleted.last_access
 WHERE ip = '127.0.0.1';
 
--- MariaDB: RETURNING (INSERT/DELETE/REPLACE). MySQL 8.x **không** có RETURNING.
+-- MariaDB: RETURNING (INSERT/DELETE/REPLACE). MySQL 8.x và 9.x không có RETURNING.
 ```
 
 
@@ -1848,9 +1862,11 @@ USING (SELECT 42 AS user_id, 'dark' AS theme) AS s
 ON t.user_id = s.user_id
 WHEN MATCHED THEN UPDATE SET theme = s.theme, updated_at = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT (user_id, theme) VALUES (s.user_id, s.theme);
+-- MERGE bắt buộc dấu ; nếu còn câu SQL phía sau
 
--- SQL Server 2022+: có thể INSERT … ON. (tùy edition); pattern cũ hay dùng:
--- UPDATE … IF @@ROWCOUNT = 0 INSERT …  trong một transaction + unique index
+-- Không có INSERT … ON CONFLICT. Một dòng, unique index, trong transaction:
+-- UPDATE settings SET theme = 'dark' WHERE user_id = 42;
+-- IF @@ROWCOUNT = 0 INSERT INTO settings (user_id, theme) VALUES (42, 'dark');
 
 -- MySQL 8.0.20+: alias, đừng dùng VALUES() deprecated
 INSERT INTO settings (user_id, theme)
@@ -1865,13 +1881,16 @@ Cần **UNIQUE** (hoặc PK) trên khóa xung đột. `MERGE` SQL Server dễ de
 `DELETE FROM logs WHERE created_at < …` mười triệu row = WAL/log khổng lồ, lock lâu, replica tụt, `VACUUM` / index phình (Phần 6). Cắt lô nhỏ, commit giữa chừng:
 
 ```sql
--- PostgreSQL: lặp đến khi 0 row
-DELETE FROM logs
-WHERE ctid IN (
-  SELECT ctid FROM logs
+-- PostgreSQL: lặp đến khi 0 row. Dùng PK, đừng ctid (ctid đổi khi HOT/update)
+WITH batch AS (
+  SELECT id FROM logs
   WHERE created_at < DATE '2024-01-01'
+  ORDER BY id
   LIMIT 5000
-);
+)
+DELETE FROM logs
+USING batch
+WHERE logs.id = batch.id;
 
 -- SQL Server
 DELETE TOP (5000)
@@ -2208,15 +2227,15 @@ Keyset pagination cùng cột thời gian: cursor `created_at, id`, so sánh b�
 Khuyến nghị: auto-increment cho internal PK; thêm cột UUID riêng cho URL/API.
 
 ```sql
--- PostgreSQL
-ALTER TABLE users ADD COLUMN uuid UUID NOT NULL DEFAULT gen_random_uuid();
+-- PostgreSQL 18+: uuidv7() time-ordered. gen_random_uuid() / uuidv4() = random
+ALTER TABLE users ADD COLUMN uuid UUID NOT NULL DEFAULT uuidv7();
 CREATE UNIQUE INDEX users_uuid ON users (uuid);
 
--- SQL Server
+-- SQL Server: NEWSEQUENTIALID() chỉ hợp lệ làm DEFAULT, không gọi trong INSERT tùy ý
 ALTER TABLE users ADD uuid UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID();
 CREATE UNIQUE INDEX users_uuid ON users (uuid);
 
--- MySQL
+-- MySQL: UUID() là v1. swap=1 giúp index gần tuần tự hơn, không phải UUIDv7
 ALTER TABLE users ADD COLUMN uuid BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID(), 1));
 CREATE UNIQUE INDEX users_uuid ON users (uuid);
 ```
@@ -2319,7 +2338,8 @@ CREATE TABLE product_comments (
 -- PostgreSQL: CLUSTER một lần, không tự duy trì
 CLUSTER product_comments USING product_comments_pkey;
 
--- SQL Server: clustered index *luôn* giữ thứ tự vật lý (đây là mặc định)
+-- SQL Server: clustered index giữ thứ tự lá theo key (mặc định).
+-- Page split làm các page không nằm liền trên đĩa — xem Bonus.
 -- CREATE CLUSTERED INDEX ... ON product_comments (product_id, comment_id);
 ```
 
