@@ -10,6 +10,7 @@ Guides for writing scalable ASP.NET Core services. Some of the guidance is gener
 - [ASP.NET Core pipeline](AspNetCoreGuidance.md) — `HttpContext`, bodies, headers, request DI
 - [Asynchronous programming](AsyncGuidance.md) — `async`/`await`, starvation, `ConfigureAwait`, Runtime Async
 - [.NET patterns](DotnetPattern.md) — DI, options, factories, modules, tenancy, transactions
+- [DDD and Clean Architecture](DddCleanArchitecture.md) — aggregates, hexagonal ports, modular monolith, vertical slice
 - [HttpClient](HttpClientGuidance.md) — lifetime, handlers, platform implementations
 - [.NET API gotchas](Gotchas.md) — `Random.Shared`, `GeneratedRegex`, `StringComparison`, `ThrowIfNull`
 

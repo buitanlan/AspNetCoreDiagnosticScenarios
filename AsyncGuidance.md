@@ -14,6 +14,7 @@
   - [Always create `TaskCompletionSource<T>` with `TaskCreationOptions.RunContinuationsAsynchronously`](#always-create-taskcompletionsourcet-with-taskcreationoptionsruncontinuationsasynchronously)
   - [Always dispose `CancellationTokenSource`(s) used for timeouts](#always-dispose-cancellationtokensources-used-for-timeouts)
   - [Always flow `CancellationToken`(s) to APIs that take a `CancellationToken`](#always-flow-cancellationtokens-to-apis-that-take-a-cancellationtoken)
+    - [`HttpClient.Timeout` is a separate timer](#httpclienttimeout-is-a-separate-timer)
   - [Cancelling uncancellable operations](#cancelling-uncancellable-operations)
     - [Prefer `Task.WaitAsync` (.NET 6+)](#prefer-taskwaitasync-net-6)
     - [Using `CancellationToken` (legacy pattern)](#using-cancellationtoken-legacy-pattern)
@@ -788,7 +789,25 @@ catch (OperationCanceledException)
 }
 ```
 
+### `HttpClient.Timeout` is a separate timer
 
+Default `HttpClient.Timeout` is **100 seconds**. It is not `CancellationToken`. When it fires, `GetAsync` throws `TaskCanceledException` even though the caller's token is **not** canceled. A bare `catch (OperationCanceledException)` treats that timeout as "the client went away".
+
+:white_check_mark: **GOOD** Turn off the built-in timer and own the deadline with a linked token (typed client / factory—do not `new HttpClient()` per call).
+
+```C#
+// once, when configuring the client
+client.Timeout = Timeout.InfiniteTimeSpan;
+
+public async Task<string> GetAsync(string url, CancellationToken cancellationToken)
+{
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    cts.CancelAfter(TimeSpan.FromSeconds(10));
+    return await _client.GetStringAsync(url, cts.Token);
+}
+```
+
+`ConnectTimeout` on `SocketsHttpHandler` is only the TCP connect. It does not replace a deadline for the whole request.
 
 ## Cancelling uncancellable operations
 
@@ -1160,7 +1179,7 @@ public async Task ProcessAsync(IEnumerable<Task<Data>> tasks, CancellationToken 
 }
 ```
 
-
+`WithCancellation` stops the **loop**, not the tasks already started. Cancel those yourself (linked token passed into each operation) or they keep running after the `await foreach` ends.
 
 ## `IAsyncEnumerable<T>` and `await foreach`
 
@@ -1230,7 +1249,7 @@ public async Task ProcessAllAsync(IEnumerable<int> ids, CancellationToken cancel
 
 ## Async synchronization with `SemaphoreSlim`
 
-`lock` / `Monitor` / `Mutex` are not async-friendly—you cannot `await` inside a `lock`. Use `SemaphoreSlim` (or higher-level pipelines) to gate async work.
+`lock` / `Monitor` / `Mutex` / [`System.Threading.Lock`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.lock) (.NET 9) are not async-friendly—you cannot `await` inside them. `Lock` is a faster sync lock, not an async lock. Use `SemaphoreSlim` (or a channel) to gate async work.
 
 ❌ **BAD** Holds a lock across an await (compile error / dangerous patterns with `Monitor`).
 
@@ -1852,8 +1871,11 @@ Relevant improvements that apply to Runtime Async and/or all async continuations
 3. **Cached continuations** — reuse continuations for runtime-async callable task thunks.
 4. **Skip empty** `ExecutionContext` **capture/restore** — if there is no ambient state to restore (no `AsyncLocal` / related data), `Task` / `Task<T>` / `ValueTask` / `ValueTask<T>` continuations skip the capture/restore cycle. High-throughput code that uses `AsyncLocal` sparingly (and often `ConfigureAwait(false)`) benefits.
 5. **Continuation reuse / fewer saved locals** — lower allocation pressure in async-heavy paths.
-6. **Covariant** `Task` **→** `Task<T>` **overrides** — virtual dispatch works for both flavors (including NativeAOT).
-7. **Pooled methods opt out** of Runtime Async when pooling already covers them, avoiding redundant work.
+6. **Tiered async compilation** — hot async methods get tier-1 codegen after warm-up, not only the first quick JIT.
+7. **Factory intrinsics** — the JIT folds `Task.FromResult`, `Task.CompletedTask`, and `ValueTask.FromResult` into the runtime-async fast path.
+8. **Tail-await** — a method that directly returns another async result can tail-call again; `await Task.Yield()` allocates less on this path.
+9. **Covariant** `Task` **→** `Task<T>` **overrides** — virtual dispatch works for both flavors (including NativeAOT).
+10. **Pooled methods opt out** of Runtime Async when pooling already covers them, avoiding redundant work.
 
 
 
@@ -2250,7 +2272,8 @@ Unobserved `Task` exceptions eventually raise [`TaskScheduler.UnobservedTaskExce
 ## Exceptions and cancellation
 
 - `await` throws the **inner** exception. `.Result` / `.Wait()` throw `AggregateException`.
-- Request abort, `CancelAfter`, and `WaitAsync` typically throw `OperationCanceledException` (sometimes `TaskCanceledException`, a subclass). Filter with `when (ct.IsCancellationRequested)` so real failures are not swallowed.
+- Request abort and `CancelAfter` throw `OperationCanceledException` (`TaskCanceledException` is a subclass). `Task.WaitAsync(CancellationToken)` does too. `Task.WaitAsync(TimeSpan)` throws **`TimeoutException`**, not `OperationCanceledException`.
+- Filter with `when (cancellationToken.IsCancellationRequested)` so a timeout or a real fault is not treated as "the client disconnected". `HttpClient.Timeout` (default 100s) is one of those timeouts—see [above](#httpclienttimeout-is-a-separate-timer).
 - Do not catch `Exception` and return `200` on cancel. ASP.NET Core already treats `OperationCanceledException` as a canceled request when it matches `RequestAborted`.
 - In CPU-bound loops, call `cancellationToken.ThrowIfCancellationRequested()`—tokens do nothing unless observed.
 
@@ -2314,6 +2337,7 @@ Turn these on in CI (SDK analyzers / CA rules). They encode much of this documen
 |------|-----------------|
 | [CA1849](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/quality-rules/ca1849) | Calling a sync method when an async overload exists |
 | [CA2016](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/quality-rules/ca2016) | Not forwarding `CancellationToken` |
+| [CA2012](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/quality-rules/ca2012) | Using a `ValueTask` incorrectly (multiple awaits, `.Result`) |
 | [CA2007](https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/quality-rules/ca2007) | Missing `ConfigureAwait` (useful in **libraries**, noisy in ASP.NET Core apps) |
 | CS4014 | Unawaited `Task` (fire-and-forget) |
 | CS1998 | `async` method with no `await` |

@@ -1919,3 +1919,4 @@ public async Task<string> ReadAllAsync(Stream stream, CancellationToken cancella
 - [AsyncGuidance.md](AsyncGuidance.md) — `async`/`await`, `ConfigureAwait`, channels, Runtime Async
 - [HttpClientGuidance.md](HttpClientGuidance.md) — `HttpClient` lifetime and platform handlers
 - [Gotchas.md](Gotchas.md) — `Random.Shared`, `GeneratedRegex`, `StringComparison`, `ThrowIfNull`
+- [DddCleanArchitecture.md](DddCleanArchitecture.md) — aggregates, hexagonal ports, modular monolith, vertical slice
