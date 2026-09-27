@@ -87,6 +87,7 @@
     - [What a module owns](#what-a-module-owns)
     - [How modules talk](#how-modules-talk)
     - [The host composes modules](#the-host-composes-modules)
+    - [Load modules from disk](#load-modules-from-disk)
     - [Enforce the module boundary](#enforce-the-module-boundary)
     - [When to split a module out](#when-to-split-a-module-out)
   - [Vertical slice](#vertical-slice)
@@ -3132,6 +3133,178 @@ app.Run();
 
 One connection string can point both modules at the same instance. The schemas differ (`ordering`, `billing`). Two connection strings are how you later move Billing to another instance without editing handlers.
 
+The host project above references Ordering and Billing, so `AddOrdering` is a normal method call. When the host must not take that reference, load the module dll at startup instead. See [Load modules from disk](#load-modules-from-disk).
+
+### Load modules from disk
+
+Dynamic load means the host process starts, reads a list of module names, and loads those assemblies. It does not mean a request uploads a dll, and it does not mean you unload Billing while the site is serving traffic. `AssemblyLoadContext` can be collectible. The DI container and the endpoint route table cannot drop types that are already registered. A module change is a restart.
+
+Use this when the host should not have a `ProjectReference` to Ordering. If it already has that reference, call `AddOrdering` or scan `IModule` in assemblies that are already loaded. That scan is in [DotnetPattern.md](DotnetPattern.md#fluent-module--vertical-slice-registration). Loading a dll is the step after that, for a module the compiler has never seen.
+
+Three assemblies:
+
+| Assembly | Referenced by | Contains |
+|----------|----------------|----------|
+| `Modules.Abstractions` | Host and every module | `IModule` only |
+| `Ordering.Contracts` | Billing, and Ordering | `OrderPlacedV1`, `IOrderTotals` |
+| `Ordering.dll` | Nobody at compile time. The host loads it | `OrderingModule`, the aggregate, EF |
+
+`IModule` lives in one assembly. If Ordering compiles against a copy of the interface and the host compiles against another, `IsAssignableFrom` is false and the loader finds zero modules. Both sides must reference the same `Modules.Abstractions.dll`, and the loader must return the host's already-loaded copy of that assembly.
+
+```C#
+public interface IModule
+{
+    void AddServices(IHostApplicationBuilder builder);
+    void MapEndpoints(IEndpointRouteBuilder endpoints);
+}
+```
+
+```C#
+public sealed class OrderingModule : IModule
+{
+    public void AddServices(IHostApplicationBuilder builder) =>
+        builder.Services.AddOrdering(builder.Configuration);
+
+    public void MapEndpoints(IEndpointRouteBuilder endpoints) =>
+        endpoints.MapOrdering();
+}
+```
+
+The module type has no constructor dependencies. `AddServices` receives the builder, so configuration and `IServiceCollection` are available there. `Activator.CreateInstance` cannot inject `OrderingDbContext`.
+
+Publish the module so `Ordering.deps.json` sits beside `Ordering.dll`. `AssemblyDependencyResolver` reads that file. Copying the dll alone leaves EF and Npgsql unresolved.
+
+```bash
+dotnet publish src/Ordering/Ordering.csproj -o src/Host/modules/Ordering
+```
+
+`appsettings.json` is the list and the order. Billing is after Ordering when Billing's `Add` expects a service Ordering registered. Prefer events so the order does not matter. The list is deploy configuration, not a path taken from a request.
+
+```json
+{
+  "Modules": [ "Ordering", "Billing" ]
+}
+```
+
+```C#
+public sealed class ModuleLoadContext : AssemblyLoadContext
+{
+    private readonly AssemblyDependencyResolver _resolver;
+
+    public ModuleLoadContext(string modulePath)
+        : base(Path.GetFileNameWithoutExtension(modulePath), isCollectible: false)
+    {
+        _resolver = new AssemblyDependencyResolver(modulePath);
+    }
+
+    protected override Assembly? Load(AssemblyName assemblyName)
+    {
+        var shared = Default.Assemblies.FirstOrDefault(loaded =>
+            string.Equals(loaded.GetName().Name, assemblyName.Name, StringComparison.OrdinalIgnoreCase));
+        if (shared is not null)
+            return shared;
+
+        var path = _resolver.ResolveAssemblyToPath(assemblyName);
+        return path is null ? null : LoadFromAssemblyPath(path);
+    }
+
+    protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
+    {
+        var path = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+        return path is null ? IntPtr.Zero : LoadUnmanagedDllFromPath(path);
+    }
+}
+```
+
+Returning the default-context assembly for `Modules.Abstractions`, ASP.NET Core, and EF keeps one type identity. A second load of `IModule` from the module folder makes the cast fail at runtime with no compile error.
+
+```C#
+public static class ModuleLoader
+{
+    public static IReadOnlyList<IModule> Load(string contentRoot, IConfiguration configuration)
+    {
+        var names = configuration.GetSection("Modules").Get<string[]>() ?? [];
+        var root = Path.GetFullPath(Path.Combine(contentRoot, "modules"));
+        var modules = new List<IModule>(names.Length);
+
+        foreach (var name in names)
+        {
+            if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(['/', '\\', '.']) >= 0)
+                throw new InvalidOperationException($"Module name '{name}' is not a single folder name.");
+
+            var dll = Path.GetFullPath(Path.Combine(root, name, $"{name}.dll"));
+            if (!dll.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Module '{name}' is outside {root}.");
+
+            var context = new ModuleLoadContext(dll);
+            var assembly = context.LoadFromAssemblyPath(dll);
+            modules.Add((IModule)Activator.CreateInstance(FindModuleType(assembly))!);
+        }
+
+        return modules;
+    }
+
+    private static Type FindModuleType(Assembly assembly)
+    {
+        IEnumerable<Type?> types;
+        try
+        {
+            types = assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            var details = string.Join(Environment.NewLine, ex.LoaderExceptions.Select(e => e?.Message));
+            throw new InvalidOperationException(
+                $"Could not load types from {assembly.Location}. {details}", ex);
+        }
+
+        var found = types
+            .Where(type => type is { IsAbstract: false, IsInterface: false }
+                           && typeof(IModule).IsAssignableFrom(type))
+            .Cast<Type>()
+            .ToArray();
+
+        return found.Length == 1
+            ? found[0]
+            : throw new InvalidOperationException(
+                $"{assembly.GetName().Name} exposes {found.Length} IModule types. Expected one.");
+    }
+}
+```
+
+Reject a name that contains `..` or a separator before you combine paths. `GetFullPath` plus a prefix check is the backstop. Do not `LoadFromAssemblyPath` every dll in the host output: that loads the host and the shared framework a second time.
+
+```C#
+var builder = WebApplication.CreateBuilder(args);
+var modules = ModuleLoader.Load(builder.Environment.ContentRootPath, builder.Configuration);
+foreach (var module in modules)
+    module.AddServices(builder);
+
+builder.Services.AddSingleton<IReadOnlyList<IModule>>(modules);
+
+var app = builder.Build();
+foreach (var module in app.Services.GetRequiredService<IReadOnlyList<IModule>>())
+    module.MapEndpoints(app);
+app.Run();
+```
+
+`dotnet ef migrations add` still needs a startup project that references the module. The web host's dynamic load does not put Ordering on the compiler's reference list, so the EF tool cannot see `OrderingDbContext` from `Host` alone. Run migrations from the module project, or from a small migrator project that has the `ProjectReference`.
+
+#### ❌ BAD — a plugin folder you hot-swap
+
+```C#
+app.MapPost("/admin/modules", async (IFormFile dll) =>
+{
+    var path = Path.Combine("modules", dll.FileName);
+    await using var stream = File.Create(path);
+    await dll.CopyToAsync(stream);
+    var assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.GetFullPath(path));
+    // register types while requests are in flight
+});
+```
+
+The file name is caller-controlled. `LoadFromAssemblyPath` on the default context does not apply `Ordering.deps.json`, so Npgsql fails to resolve or binds a different copy. Types registered after `app.Run` are not a module. They are code execution on the server.
+
 ### Enforce the module boundary
 
 `internal` on `Order` stops other assemblies from naming the type. It does not stop Billing from referencing the Ordering project and using every `public` type you forgot. Keep the implementation assembly's public surface to `OrderingModule`, the handlers the host maps, and the contract interfaces you meant to publish. Prefer those interfaces in `Ordering.Contracts`, so the implementation assembly has almost no public API.
@@ -3272,7 +3445,7 @@ public static IEndpointRouteBuilder MapOrdering(this IEndpointRouteBuilder app)
 }
 ```
 
-Discovery by reflection (`every class ending in Handler`) will register a test double, a base class, and the wrong lifetime. An explicit list is short when each module owns it. If you do scan, scan `IModule` only, cache the result, and keep feature services in `Add`. See [DotnetPattern.md](DotnetPattern.md#fluent-module--vertical-slice-registration).
+Discovery by reflection (`every class ending in Handler`) will register a test double, a base class, and the wrong lifetime. An explicit list is short when each module owns it. Scanning `IModule` is for assemblies the host already references. A dll the host does not reference is [loaded from disk](#load-modules-from-disk). See [DotnetPattern.md](DotnetPattern.md#fluent-module--vertical-slice-registration).
 
 ### What slices share
 
@@ -3519,6 +3692,7 @@ That statement is infrastructure. It bypasses `Stock.Reserve` and the domain eve
 - **AutoMapper profiles that write into aggregate setters** you made public for the mapper. Map DTOs at the edge. Call `Place` and `Cancel` for changes.
 - **Sharing `Money` in a shared kernel the moment billing needs negative amounts.** Duplicate the struct.
 - **Six projects because a hexagon has six sides.** HTTP and PostgreSQL are two adapters. A folder is enough until a SDK should not compile into the web host.
+- **Loading every dll in the host output, or a dll from a request.** Load the names in configuration, from a `modules` directory you deployed, once at startup. See [Load modules from disk](#load-modules-from-disk).
 - **A port for `Order`, `Money`, and `OrderLine`.** Those are the model. A port is a boundary you replace: the price list, the gateway, the repository.
 - **One `DbContext` for every module because there is one process.** The process is shared. The model, the schema, and the migration history are not.
 - **A vertical slice with its own `Order` class.** Slices in one module share the aggregate. Copying the entity per feature puts the status rules back in each handler.
