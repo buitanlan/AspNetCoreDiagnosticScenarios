@@ -73,8 +73,21 @@
     - [Publish without holding the row lock](#publish-without-holding-the-row-lock)
     - [Inbox](#inbox)
     - [Poison rows](#poison-rows)
+  - [Event sourcing](#event-sourcing)
+    - [The stream is the record](#the-stream-is-the-record)
+    - [Decide, then append](#decide-then-append)
+    - [Expected version](#expected-version)
+    - [Rebuild reads from the stream](#rebuild-reads-from-the-stream)
+    - [Snapshots and old payloads](#snapshots-and-old-payloads)
+    - [When the order table is enough](#when-the-order-table-is-enough)
   - [Anti-corruption layer](#anti-corruption-layer)
   - [A payment process](#a-payment-process)
+  - [Saga with MassTransit](#saga-with-masstransit)
+    - [The saga is not the aggregate](#the-saga-is-not-the-aggregate)
+    - [The state machine](#the-state-machine)
+    - [Commit the saga row with the publish](#commit-the-saga-row-with-the-publish)
+    - [One timeout](#one-timeout)
+    - [Register the bus](#register-the-bus)
   - [Testing](#testing)
     - [Aggregate tests](#aggregate-tests)
     - [Handler tests](#handler-tests)
@@ -134,6 +147,8 @@ One ordering context runs from the domain model through payment. A second contex
 | Put Billing beside Ordering in one process | [Modular monolith](#modular-monolith) |
 | Keep one use case in one folder | [Vertical slice](#vertical-slice) |
 | See one request on a timeline | [Worked examples](#worked-examples) |
+| Decide whether the order row or the event stream is the record | [Event sourcing](#event-sourcing) |
+| Coordinate payment that lives on the bus | [Saga with MassTransit](#saga-with-masstransit) |
 
 [What to skip](#what-to-skip) and the [checklist](#checklist) repeat the same rules in short form.
 
@@ -639,7 +654,7 @@ That port is application-level. The directory's implementation reads the custome
 
 **One transaction, one root** is the default because the aggregate is the lock boundary. Two clerks paying two orders do not block each other.
 
-**Place and reserve** in this sample touch `Order` and `Stock` in one commit on purpose. They sit in the same bounded context, the same database, and the business rule is "we do not create an order we could not reserve". A saga would leave a `Placed` order with no reserve and a worker to repair it. That machinery is justified when stock lives in another service. It is ceremony when both rows are in schema `ordering`.
+**Place and reserve** in this sample touch `Order` and `Stock` in one commit on purpose. They sit in the same bounded context, the same database, and the business rule is "we do not create an order we could not reserve". A saga would leave a `Placed` order with no reserve and a worker to repair it. That machinery is justified when stock or payment lives in another service. See [Saga with MassTransit](#saga-with-masstransit). It is ceremony when both rows are in schema `ordering`.
 
 The cost is a hot `stock` row for a popular SKU. Keep the transaction short: load stock, `Reserve`, commit. Do not call the payment vendor while that row lock is held. Payment happens after commit, from the outbox or from the next request.
 
@@ -2276,6 +2291,8 @@ Do not point EF's `Order` aggregate at the summary table. Two models, two types.
 | Integration event | Mapper in infrastructure, from a domain event | Other contexts and other services | `ordering.order_placed.v1` with `Guid` fields |
 | Application notification | A handler, rarely | In-process UI cache bust, metrics | Prefer the integration event so a restart does not drop it |
 
+The `orders` row is still the record in this guide. The outbox is a copy you publish after commit. [Event sourcing](#event-sourcing) is the other choice: the stream is the record, and the row is a projection. Do not keep both as the authority.
+
 Publish the integration event, not the domain type. The domain record will gain a field because a use case needed it, and every consumer will break. The domain record's JSON also needs converters for `OrderId`. Consumers should not need those converters.
 
 ```C#
@@ -2605,6 +2622,293 @@ A deserializer that throws is a failed attempt, not a process crash. Catch it in
 
 Order of events for one order is usually the order you inserted them (`occurred_at`, then `id`). Across orders, consumers must not assume global order. `order_paid` can be delivered to billing before billing has consumed `order_placed` if you use two queues. The consumer that cannot find the invoice yet should retry (not mark the inbox done). A retry with backoff beats a permanent failure for a message that arrived early.
 
+## Event sourcing
+
+Event sourcing stores the history of one aggregate as an append-only stream. The current `Order` is what you get by folding that stream. There is no `orders` row to update.
+
+The `Order` earlier in this guide is the other model. `Place` sets fields, EF writes columns, and the outbox carries a copy of the fact. That is enough for this checkout. Event sourcing replaces the row when the history itself is the thing you must not lose: a dispute about who cancelled, a price that was agreed at a moment, a regulator who wants every transition.
+
+### The stream is the record
+
+One stream per aggregate. The id is the `OrderId`. Version 1 is the first event. You never `UPDATE` a stored event and you never delete one to hide a mistake. A correction is a new event.
+
+```text
+stream 0f3c…   version 1   ordering.order_placed.v1
+               version 2   ordering.order_quantity_changed.v1
+               version 3   ordering.order_cancelled.v1
+```
+
+```sql
+CREATE TABLE ordering.order_events (
+  stream_id    uuid        NOT NULL,
+  version      bigint      NOT NULL,
+  type         text        NOT NULL,
+  payload      jsonb       NOT NULL,
+  occurred_at  timestamptz NOT NULL,
+  PRIMARY KEY (stream_id, version)
+);
+```
+
+`jsonb` is PostgreSQL. On SQL Server the payload is `nvarchar(max)`. The primary key is the concurrency control: two transactions cannot insert version 3 for the same stream.
+
+The event has to carry every fact the fold needs. The `OrderPlaced` used as a notification earlier in the guide only has an id and a time. That cannot rebuild lines, the ship-to address, or the price. The stored event is the full fact:
+
+```C#
+public sealed record StoredOrderPlaced(
+    Guid EventId,
+    Guid OrderId,
+    Guid CustomerId,
+    string ShipLine1,
+    string ShipCity,
+    string ShipPostalCode,
+    string ShipCountry,
+    IReadOnlyList<StoredLine> Lines,
+    DateTimeOffset OccurredAt);
+
+public sealed record StoredLine(Guid ProductId, string ProductName, int Quantity, decimal Amount, string Currency);
+
+public sealed record StoredOrderCancelled(Guid EventId, Guid OrderId, DateTimeOffset OccurredAt);
+```
+
+Stable names (`ordering.order_placed.v1`) still apply. A rename of the C# record is not a new version. A new required field is `ordering.order_placed.v2`, and old rows stay v1. See [Snapshots and old payloads](#snapshots-and-old-payloads).
+
+Marten, EventStoreDB, and SqlStreamStore are adapters behind a port. The domain does not reference them. A Postgres table is enough to see the rule. The library comes when you already have the fold and the version check.
+
+### Decide, then append
+
+A command checks the current fold and raises a new event. Loading the stream applies events and does not run those checks again. That is the same split as [loading must not replay factories](#loading-must-not-replay-factories): `Place` decides, `Apply` only copies the fact onto fields.
+
+```C#
+public sealed class Order
+{
+    private readonly List<object> _uncommitted = [];
+
+    private Order() { }
+
+    public OrderId Id { get; private set; }
+    public OrderStatus Status { get; private set; }
+    public long Version { get; private set; }
+    public IReadOnlyList<object> UncommittedEvents => _uncommitted;
+
+    public static Order Place(
+        OrderId id,
+        CustomerId customerId,
+        Address shipTo,
+        IReadOnlyList<OrderLine> lines,
+        DateTimeOffset now)
+    {
+        if (lines.Count == 0)
+            throw new DomainRuleException("An order needs at least one line.");
+
+        var order = new Order();
+        order.Raise(new StoredOrderPlaced(
+            Guid.CreateVersion7(),
+            id.Value,
+            customerId.Value,
+            shipTo.Line1,
+            shipTo.City,
+            shipTo.PostalCode,
+            shipTo.Country,
+            lines.Select(line => new StoredLine(
+                line.ProductId.Value,
+                line.ProductName,
+                line.Quantity,
+                line.UnitPrice.Amount,
+                line.UnitPrice.Currency)).ToArray(),
+            now));
+        return order;
+    }
+
+    public void Cancel(DateTimeOffset now)
+    {
+        if (Status != OrderStatus.Placed)
+            throw new DomainRuleException("Only a placed order can be cancelled.");
+
+        Raise(new StoredOrderCancelled(Guid.CreateVersion7(), Id.Value, now));
+    }
+
+    public static Order Rehydrate(IEnumerable<object> history)
+    {
+        var order = new Order();
+        foreach (var stored in history)
+            order.Apply(stored, isNew: false);
+        return order;
+    }
+
+    public void MarkCommitted()
+    {
+        Version += _uncommitted.Count;
+        _uncommitted.Clear();
+    }
+
+    private void Raise(object stored)
+    {
+        Apply(stored, isNew: true);
+        _uncommitted.Add(stored);
+    }
+
+    private void Apply(object stored, bool isNew)
+    {
+        switch (stored)
+        {
+            case StoredOrderPlaced placed:
+                Id = new OrderId(placed.OrderId);
+                Status = OrderStatus.Placed;
+                break;
+            case StoredOrderCancelled:
+                Status = OrderStatus.Cancelled;
+                break;
+            default:
+                throw new InvalidOperationException($"No apply for {stored.GetType().Name}.");
+        }
+
+        if (!isNew)
+            Version++;
+    }
+}
+```
+
+`Apply` does not throw `DomainRuleException`. A rule you add next month ("orders over 100 lines are rejected") must not stop you from loading a stream that was legal when it was written. The new rule lives in `Place`. Old events still fold.
+
+This fold only keeps `Id`, `Status`, and `Version`. `StoredOrderPlaced` still carries the lines and the address. A projection, and any later `Apply` that needs a line, reads them from the event. Dropping them from the payload means the stream cannot rebuild the order.
+
+`Rehydrate` of an empty stream is version 0 and is not an order yet. `Place` starts there. `GetAsync` returns null when the stream has no rows, and the handler throws `NotFoundException`. Do not treat version 0 as a cancelled order.
+
+### Expected version
+
+The handler loads the stream, calls one method, and appends. The version it loaded is the version it expects to still be current.
+
+```C#
+public sealed class EventOrderRepository(OrderingDbContext db)
+{
+    public async Task<Order?> GetAsync(OrderId id, CancellationToken cancellationToken)
+    {
+        var rows = await db.OrderEvents.AsNoTracking()
+            .Where(row => row.StreamId == id.Value)
+            .OrderBy(row => row.Version)
+            .ToListAsync(cancellationToken);
+
+        return rows.Count == 0
+            ? null
+            : Order.Rehydrate(rows.Select(row => EventCodec.Decode(row.Type, row.Payload)));
+    }
+
+    public async Task SaveAsync(Order order, CancellationToken cancellationToken)
+    {
+        var version = order.Version;
+        foreach (var stored in order.UncommittedEvents)
+        {
+            version++;
+            db.OrderEvents.Add(new OrderEventRow
+            {
+                StreamId = order.Id.Value,
+                Version = version,
+                Type = EventCodec.Name(stored),
+                Payload = EventCodec.Serialize(stored),
+                OccurredAt = EventCodec.OccurredAt(stored)
+            });
+        }
+
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (PostgresUniqueViolation.Is(ex))
+        {
+            throw new ConflictException("The order stream moved. Reload and retry.");
+        }
+
+        order.MarkCommitted();
+    }
+}
+```
+
+Two cancels both read version 2. Both try to insert version 3. The primary key keeps one. The other is a 409, same as [two writers](#two-writers-one-row) on `xmin`. There is no `orders` row and no `xmin` on this stream. The version column is the token.
+
+Read the current max version in the same transaction if you want a clean conflict before the insert. The unique key is still the authority. A check-then-insert without that key loses the race the same way a missing idempotency index does. After a unique violation the `DbContext` is dirty. Dispose the scope and let the client retry. Do not call `SaveAsync` again on that context.
+
+A retried `Place` must not append a second `OrderPlaced` onto a new stream id. Keep the idempotency key, in its own table or as a unique index that maps the key to the stream id, and return the original id. See [Idempotency](#idempotency). The stream does not make the HTTP retry safe by itself.
+
+### Rebuild reads from the stream
+
+A list screen does not fold every stream. It reads a projection, the same shape as [a separate read model](#a-separate-read-model). The difference is where the projection gets its facts: from `order_events`, not from an `orders` table.
+
+```C#
+public sealed class OrderEventRow
+{
+    public Guid StreamId { get; set; }
+    public long Version { get; set; }
+    public string Type { get; set; } = "";
+    public string Payload { get; set; } = "";
+    public DateTimeOffset OccurredAt { get; set; }
+}
+
+public sealed class StreamCheckpoint
+{
+    public string Name { get; set; } = "";
+    public Guid StreamId { get; set; }
+    public long Version { get; set; }
+}
+```
+
+The projector takes events with `version` greater than its checkpoint, updates `order_summaries`, and advances the checkpoint in the same transaction. A crash repeats the last event. The projection handles that the way the [inbox](#inbox) does: the write is keyed by `(stream_id, version)` so applying version 3 twice is a no-op.
+
+The list can lag the stream. A `GET` by id that must be current folds the stream in the command model. The list uses the projection. Do not query `order_events` with `OFFSET` to render a page. That reads every payload. The summary table is indexed the same way as any other list. See [Database_Indexing.md](Database_Indexing.md).
+
+Other modules still see `ordering.order_cancelled.v1`, not your stream table. A subscription that publishes integration events after the append commits is the outbox. You can use the stream itself as that queue if a worker reads past a global checkpoint. You still do not publish before the append commits.
+
+### Snapshots and old payloads
+
+Folding a stream of tens of thousands of events on every cancel is the point where a snapshot pays. The snapshot is a cache of the fold at a version. Load it, then apply events with `version` greater than the snapshot. Delete every snapshot and the stream still rebuilds the order. If the snapshot and the stream disagree, the stream wins. Do not write the snapshot in place of the next event.
+
+```C#
+public sealed class OrderSnapshot
+{
+    public Guid StreamId { get; set; }
+    public long Version { get; set; }
+    public string Body { get; set; } = "";
+}
+```
+
+Write a snapshot every N events in the projector, or after `SaveAsync`, in a separate transaction. A failed snapshot write must not roll back the append.
+
+Payloads from last year are missing fields you added last week. Decode them with an upcaster before `Apply`:
+
+```C#
+public static object Decode(string type, string payload) => type switch
+{
+    "ordering.order_placed.v1" => JsonSerializer.Deserialize<StoredOrderPlaced>(payload)!,
+    "ordering.order_placed.v0" => UpgradeV0(JsonSerializer.Deserialize<OrderPlacedV0>(payload)!),
+    "ordering.order_cancelled.v1" => JsonSerializer.Deserialize<StoredOrderCancelled>(payload)!,
+    _ => throw new InvalidOperationException($"Unknown event type {type}.")
+};
+```
+
+`UpgradeV0` fills the new field with the value you would have stored then (a default currency, an empty ship-to you can detect). It does not invent a price. Unknown `type` fails the load. Skipping it silently drops a transition and the fold is a lie.
+
+Personal data in a payload is hard to erase, because you cannot `UPDATE` the event without rewriting history. Keep the secret outside the stream (a key id in the event, the value in a store you can delete) when a regulation requires erasure. A new "redacted" event does not remove the old payload.
+
+### When the order table is enough
+
+Stay with the `orders` row and the outbox when:
+
+- the questions you answer are about the current status, not about the sequence that produced it
+- the audit you need is "who called cancel", which an application log or one history table can hold
+- the aggregate is a hot counter (`Stock.Reserved`). A stream per SKU becomes the contention point, and the read you need is the current available count
+
+Move one aggregate to a stream when losing an intermediate state would cost a dispute or a fine, and you are willing to run projections for every screen. Do not convert Billing, Stock, and the product catalog in the same change.
+
+#### ❌ BAD — two authorities
+
+```C#
+await db.Orders.AddAsync(order, cancellationToken);
+foreach (var stored in order.UncommittedEvents)
+    db.OrderEvents.Add(ToRow(stored));
+await db.SaveChangesAsync(cancellationToken);
+```
+
+The row and the stream both claim to be the order. A bug that updates one and not the other is a silent fork. After you adopt the stream, stop writing the `orders` table from the command path. The summary projection is allowed to write a read table. It is not allowed to be the source you load in `Cancel`.
+
 ## Anti-corruption layer
 
 The payment vendor's API is a bounded context you do not control. Translate at the edge. `Order` understands `MarkPaid` and `MarkPaymentFailed`. It does not understand `"CAPTURED"`, `"REQUIRES_ACTION"`, or a vendor error struct.
@@ -2758,6 +3062,258 @@ public sealed class ExpireUnpaidOrders(
 Fifteen minutes is a product rule. It lives next to the sweeper, not inside `Order.Place`. The aggregate does not know the timeout. If you pass `payBy` into `Place` and store it, the aggregate can refuse `MarkPaid` after that instant. That is a stronger rule ("we do not take money after the reserve expired") and it belongs on `Order` if finance asked for it. The sweeper is what *causes* the failure in time. The method is what *allows* it.
 
 Do not run the sweeper's query inside `Place`. Do not hold the stock row lock for fifteen minutes. Reserve, commit, release later.
+
+When payment is a message on the bus, this sweeper and the saga must not both expire the same order. The bus version is [Saga with MassTransit](#saga-with-masstransit).
+
+## Saga with MassTransit
+
+A saga is the state of a process that spans more than one transaction. Here that process is: the order is placed, payment is requested, and either the capture arrives or fifteen minutes pass. MassTransit stores that state in a row and moves it with a state machine (`MassTransitStateMachine<T>`, in the main package since MassTransit 8). The messages are the facts. The saga decides which command to publish next. It does not decide whether an order is allowed to be paid.
+
+`ExpireUnpaidOrders` is this process inside one database. Use that while a webhook in this process calls `MarkOrderPaidHandler`. Use the saga when a payment service publishes `PaymentCaptured` or `PaymentFailed` and this process must not poll. Once the saga owns the wait, the webhook adapter publishes `PaymentCaptured`. It does not call the handler, and the sweeper is off.
+
+### The saga is not the aggregate
+
+| | `Order` | Payment saga |
+|--|---------|----------------|
+| Question | May this order be marked paid? | Did we ask for payment, and did the answer arrive in time? |
+| Store | `orders` row, or the event stream | `ordering.order_saga` |
+| Duplicate capture | `MarkPaid` is a no-op when status is already `Paid` | Second `PaymentCaptured` is ignored once the saga has left `AwaitingPayment` |
+| Capture after cancel | `ConflictException`, someone refunds | The saga publishes `RefundRequired` and does not publish `PayOrder` |
+
+The state machine lives in the infrastructure project. It references message contracts, not `Order`. A consumer is the driving adapter that calls the handler, the same way [the API](#the-api-is-an-adapter) does.
+
+```C#
+public sealed record RequestPayment(Guid OrderId, decimal Amount, string Currency);
+public sealed record PaymentCaptured(Guid OrderId);
+public sealed record PaymentFailed(Guid OrderId);
+public sealed record PaymentExpired(Guid OrderId);
+public sealed record PayOrder(Guid OrderId);
+public sealed record FailOrderPayment(Guid OrderId);
+public sealed record RefundRequired(Guid OrderId);
+
+public sealed class PayOrderConsumer(MarkOrderPaidHandler handler) : IConsumer<PayOrder>
+{
+    public Task Consume(ConsumeContext<PayOrder> context) =>
+        handler.HandleAsync(new MarkOrderPaid(new OrderId(context.Message.OrderId)), context.CancellationToken);
+}
+
+public sealed class FailOrderPaymentConsumer(MarkOrderPaymentFailedHandler handler)
+    : IConsumer<FailOrderPayment>
+{
+    public Task Consume(ConsumeContext<FailOrderPayment> context) =>
+        handler.HandleAsync(
+            new MarkOrderPaymentFailed(new OrderId(context.Message.OrderId)),
+            context.CancellationToken);
+}
+```
+
+`FailOrderPaymentConsumer` uses the same handler as `ExpireUnpaidOrders`: `MarkPaymentFailed` and `stock.Release`. `PayOrder` is not `Order.MarkPaid`. The handler still loads the aggregate and calls the method. A second delivery hits the handler's "already paid" return and commits nothing.
+
+### The state machine
+
+`CorrelationId` is the `OrderId`. One order, one saga row. MassTransit sets `CorrelationId` from `CorrelateById` when the first `OrderPlacedV1` creates the instance.
+
+```C#
+public sealed class OrderSaga : SagaStateMachineInstance, ISaga
+{
+    public Guid CorrelationId { get; set; }
+    public string CurrentState { get; set; } = "";
+    public Guid? PaymentTimeoutTokenId { get; set; }
+}
+
+public sealed class OrderSagaMachine : MassTransitStateMachine<OrderSaga>
+{
+    public State AwaitingPayment { get; private set; } = null!;
+    public State Paid { get; private set; } = null!;
+    public State PaymentFailed { get; private set; } = null!;
+
+    public Event<OrderPlacedV1> OrderPlaced { get; private set; } = null!;
+    public Event<PaymentCaptured> PaymentCaptured { get; private set; } = null!;
+    public Event<PaymentFailed> PaymentFailed { get; private set; } = null!;
+    public Schedule<OrderSaga, PaymentExpired> PaymentTimeout { get; private set; } = null!;
+
+    public OrderSagaMachine()
+    {
+        InstanceState(x => x.CurrentState);
+
+        Event(() => OrderPlaced, x => x.CorrelateById(m => m.Message.OrderId));
+        Event(() => PaymentCaptured, x =>
+        {
+            x.CorrelateById(m => m.Message.OrderId);
+            x.OnMissingInstance(m => m.Discard());
+        });
+        Event(() => PaymentFailed, x =>
+        {
+            x.CorrelateById(m => m.Message.OrderId);
+            x.OnMissingInstance(m => m.Discard());
+        });
+
+        Schedule(() => PaymentTimeout, saga => saga.PaymentTimeoutTokenId, schedule =>
+        {
+            schedule.Delay = TimeSpan.FromMinutes(15);
+            schedule.Received = received => received.CorrelateById(m => m.Message.OrderId);
+        });
+
+        Initially(
+            When(OrderPlaced)
+                .Publish(ctx => new RequestPayment(
+                    ctx.Message.OrderId,
+                    ctx.Message.Total,
+                    ctx.Message.Currency))
+                .Schedule(PaymentTimeout, ctx => new PaymentExpired(ctx.Message.OrderId))
+                .TransitionTo(AwaitingPayment));
+
+        During(AwaitingPayment,
+            Ignore(OrderPlaced),
+            When(PaymentCaptured)
+                .Unschedule(PaymentTimeout)
+                .Publish(ctx => new PayOrder(ctx.Saga.CorrelationId))
+                .TransitionTo(Paid),
+            When(PaymentFailed)
+                .Unschedule(PaymentTimeout)
+                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId))
+                .TransitionTo(PaymentFailed),
+            When(PaymentTimeout.Received)
+                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId))
+                .TransitionTo(PaymentFailed));
+
+        During(Paid,
+            Ignore(OrderPlaced),
+            Ignore(PaymentCaptured),
+            Ignore(PaymentTimeout.Received));
+
+        During(PaymentFailed,
+            Ignore(OrderPlaced),
+            Ignore(PaymentFailed),
+            Ignore(PaymentTimeout.Received),
+            When(PaymentCaptured)
+                .Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId)));
+    }
+}
+```
+
+`OrderPlacedV1` already has `Total` and `Currency`. The saga copies them onto `RequestPayment` and does not read the `orders` table. A capture that arrives after the timeout finds `PaymentFailed` and publishes `RefundRequired`, not `PayOrder`. That is the same incident as [a payment process](#a-payment-process): the money moved, the order did not. Returning the message to the queue will not make `MarkPaid` legal.
+
+`Ignore(OrderPlaced)` while waiting drops a second event for the same order. The inbox on the publisher already dedupes by `EventId`. The ignore is the backstop.
+
+The saga row moves to `Paid` when `PayOrder` is published, not when `MarkPaid` commits. `PayOrderConsumer` retries. The handler is idempotent, so a redelivery finishes the order. A dead-letter leaves the saga on `Paid` and the order on `Placed`. That pair is an incident, the same shape as a refund. Do not call `MarkPaid` inside `.Then` to hide it.
+
+Do not `.Finalize()`. Finalize deletes the row, and a late `PaymentCaptured` becomes a missing instance. `OnMissingInstance(Discard)` would then hide the refund. Leave the terminal row.
+
+#### ❌ BAD — the state machine is a second aggregate
+
+```C#
+When(PaymentCaptured)
+    .ThenAsync(async ctx =>
+    {
+        var orders = ctx.GetPayload<IOrderRepository>();
+        var order = await orders.GetAsync(new OrderId(ctx.Saga.CorrelationId), ctx.CancellationToken);
+        order!.MarkPaid(DateTimeOffset.UtcNow);
+    })
+```
+
+The transition runs inside the saga consume, with `DateTimeOffset.UtcNow`, and only if the repository was stuffed into the consume context. The handler's idempotency check, the stock release on failure, and the outbox for `OrderPaid` are skipped. Publish `PayOrder`. Let `PayOrderConsumer` call the handler.
+
+### Commit the saga row with the publish
+
+`Initially` inserts the saga row and publishes `RequestPayment`. A direct broker publish can accept the message and then lose the row, or commit the row and never publish. Payment then runs for an order the saga will start again, or the saga waits for a payment it never requested.
+
+MassTransit's Entity Framework outbox writes that publish into its own tables in the same `SaveChanges` as the saga row. A delivery service sends the row after commit. This is the same rule as [the outbox](#write-the-outbox-in-the-same-transaction), implemented by the bus. Package: `MassTransit.EntityFrameworkCore`.
+
+Add the three bus tables and the saga map to the existing `OnModelCreating`, after `HasDefaultSchema("ordering")`, so they land in schema `ordering`:
+
+```C#
+modelBuilder.AddInboxStateEntity();
+modelBuilder.AddOutboxMessageEntity();
+modelBuilder.AddOutboxStateEntity();
+new OrderSagaMap().Configure(modelBuilder);
+```
+
+`AddInboxStateEntity`, `AddOutboxMessageEntity`, and `AddOutboxStateEntity` are in the `MassTransit` namespace. They create `InboxState`, `OutboxState`, and `OutboxMessage`. Your checkout outbox is the table `outbox_messages`, mapped from your own `OutboxMessage` class. Leave that table alone. MassTransit must not be configured onto it.
+
+One pipe publishes `OrderPlacedV1` through your worker. The saga's `RequestPayment`, `PayOrder`, and `FailOrderPayment` go through the MassTransit outbox. Publishing `OrderPlacedV1` from both pipes delivers it twice. The inbox hides the duplicate and you still did the work twice on the way out.
+
+`UsePostgres()` on the saga repository takes `FOR UPDATE` on the saga row for the consume. Two `PaymentCaptured` deliveries cannot both transition `AwaitingPayment`. SQL Server is `UseSqlServer()` on that same repository and on the outbox. The saga repository and the outbox must use this `OrderingDbContext`. A second context commits the saga insert and the `RequestPayment` row separately. Do not wrap the two contexts in a `TransactionScope` to fake one commit.
+
+```C#
+public sealed class OrderSagaMap : SagaClassMap<OrderSaga>
+{
+    protected override void Configure(EntityTypeBuilder<OrderSaga> entity, ModelBuilder model)
+    {
+        entity.ToTable("order_saga");
+        entity.Property(x => x.CurrentState).HasMaxLength(64);
+    }
+}
+```
+
+`SagaClassMap` keys the row on `CorrelationId`. A migration that contains `order_saga`, `InboxState`, `OutboxState`, and MassTransit's `OutboxMessage` is the check that the map ran. A missing table faults the first `OrderPlacedV1`.
+
+### One timeout
+
+`Schedule` writes a delayed `PaymentExpired`. It does nothing until the bus has a scheduler. On RabbitMQ that is the delayed-message plug-in, `AddDelayedMessageScheduler`, and `UseDelayedMessageScheduler`. On Azure Service Bus it is `AddServiceBusMessageScheduler` and `UseServiceBusMessageScheduler`. A raw RabbitMQ bus without the plug-in accepts the state machine and never delivers the timeout. The order stays `AwaitingPayment` and stock stays reserved.
+
+Fifteen minutes is the same product rule as `ExpireUnpaidOrders`. Run one of them. Both will publish a failure, and `MarkPaymentFailed` throws unless the status is `Placed`. The second caller gets a `DomainRuleException` and the message retries until it dead-letters.
+
+RabbitMQ's delayed exchange does not cancel a scheduled message. Azure Service Bus, the SQL transport, and Quartz do. Call `Unschedule` so a transport that can cancel does. Still `Ignore(PaymentTimeout.Received)` in `Paid` and `PaymentFailed`, because on RabbitMQ the timeout arrives anyway. Without that ignore the endpoint faults a message for an order that already finished.
+
+### Register the bus
+
+The state machine and the two consumers are in the host or the infrastructure project, not in `Ordering.Domain`. The domain project does not reference MassTransit. `OrderSagaDefinition` is how the saga endpoint gets the transactional outbox without a second receive endpoint. `ConfigureEndpoints` already creates the saga endpoint. Configuring the saga again by hand makes two competing consumers.
+
+```C#
+public sealed class OrderSagaDefinition : SagaDefinition<OrderSaga>
+{
+    protected override void ConfigureSaga(
+        IReceiveEndpointConfigurator endpoint,
+        ISagaConfigurator<OrderSaga> saga,
+        IRegistrationContext context)
+    {
+        endpoint.UseMessageRetry(retry => retry.Intervals(
+            TimeSpan.FromMilliseconds(200),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(5)));
+        endpoint.UseEntityFrameworkOutbox<OrderingDbContext>(context);
+    }
+}
+
+services.AddMassTransit(bus =>
+{
+    bus.AddSagaStateMachine<OrderSagaMachine, OrderSaga, OrderSagaDefinition>()
+        .EntityFrameworkRepository(repository =>
+        {
+            repository.ExistingDbContext<OrderingDbContext>();
+            repository.UsePostgres();
+        });
+
+    bus.AddConsumer<PayOrderConsumer>();
+    bus.AddConsumer<FailOrderPaymentConsumer>();
+
+    bus.AddEntityFrameworkOutbox<OrderingDbContext>(outbox =>
+    {
+        outbox.UsePostgres();
+        outbox.UseBusOutbox();
+    });
+
+    bus.AddConfigureEndpointsCallback((context, name, cfg) =>
+    {
+        cfg.UseMessageRetry(retry => retry.Intervals(
+            TimeSpan.FromMilliseconds(200),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(5)));
+    });
+
+    bus.AddDelayedMessageScheduler();
+
+    bus.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(configuration["RabbitMq:Host"] ?? "localhost");
+        cfg.UseDelayedMessageScheduler();
+        cfg.ConfigureEndpoints(context);
+    });
+});
+```
+
+`PayOrderConsumer` and `FailOrderPaymentConsumer` do not need `UseEntityFrameworkOutbox`. The handlers write `OrderPaid` and `OrderPaymentFailed` through your interceptor into `outbox_messages`. A second outbox on that consumer would be for bus publishes the handler does not make.
 
 ## Testing
 
@@ -3683,6 +4239,8 @@ That statement is infrastructure. It bypasses `Stock.Reserve` and the domain eve
 - **`DbContext` or `IEmailSender` injected into `Order`.** The handler loads, the entity decides, the unit of work saves, the consumer sends mail after commit.
 - **Domain events dispatched before commit.** In-process handlers that send mail or call HTTP will do that work for a row that rolls back.
 - **Publishing the CLR type name on the bus.** Renames become breaking changes. Store `ordering.order_placed.v1`.
+- **Event sourcing every table because an outbox already exists.** The outbox is a copy. The `orders` row stays the record until you stop writing it and fold a stream. See [Event sourcing](#event-sourcing).
+- **A MassTransit saga that calls `Order.MarkPaid`.** The saga publishes `PayOrder`. The handler loads the aggregate. A saga and `ExpireUnpaidOrders` must not both expire the same order. See [Saga with MassTransit](#saga-with-masstransit).
 - **Client-supplied prices and tenant ids.** The price comes from `IPriceList`. The tenant comes from the principal.
 - **`OFFSET` pagination on the order list.** Page with `(placed_at, id)`.
 - **Lazy-loading proxies** so the model can reach into another aggregate by accident.
