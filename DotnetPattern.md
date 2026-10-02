@@ -16,6 +16,12 @@
     - [Open-generic handlers (strategy per `T`)](#open-generic-handlers-strategy-per-t)
     - [Composite over `IEnumerable<T>`](#composite-over-ienumerablet)
     - [`IServiceProviderIsService`](#iserviceproviderisservice)
+  - [Abstract, interface, and variance](#abstract-interface-and-variance)
+    - [The interface is what DI resolves](#the-interface-is-what-di-resolves)
+    - [An abstract class owns the fixed steps](#an-abstract-class-owns-the-fixed-steps)
+    - [Covariance (`out`)](#covariance-out)
+    - [Contravariance (`in`)](#contravariance-in)
+    - [Invariant is the default](#invariant-is-the-default)
   - [Lifetimes, scopes, and tenancy](#lifetimes-scopes-and-tenancy)
     - [Caching singletons in generic types](#caching-singletons-in-generic-types)
     - [Scoped work from a singleton (`IServiceScopeFactory`)](#scoped-work-from-a-singleton-iservicescopefactory)
@@ -254,7 +260,7 @@ The constructor has access to any service *and* the generic type being requested
 services.AddTransient(typeof(IServiceFactory<>), typeof(ServiceFactory<>));
 ```
 
-Then inject `IServiceFactory<MyThing>` anywhere. The closed generic is built by the container.
+Then inject `IServiceFactory<MyThing>` anywhere. The closed generic is built by the container. Register the factory as transient (as above) so a scoped `TService` is not captured by a singleton factory. Instances created with `ActivatorUtilities` are not disposed by the container.
 
 ### Lazy initialization of services
 
@@ -318,7 +324,7 @@ services.AddTransient(sp => new Lazy<IFoo>(() => sp.GetRequiredService<IFoo>()))
 services.AddTransient(sp => new Lazy<IBar>(() => sp.GetRequiredService<IBar>()));
 ```
 
-:bulb: **NOTE:** `Lazy<T>` is not thread-safe by default in the sense of *which* provider it captured. Do not resolve a scoped service through a singleton's `Lazy<T>` that closed over the root provider. See [captive dependencies](AspNetCoreGuidance.md#avoid-capturing-scoped-services-in-singletons).
+:bulb: **NOTE:** `Lazy<T>` defaults to thread-safe publication (`LazyThreadSafetyMode.ExecutionAndPublication`). The bug is which provider the factory closed over. A singleton `Lazy<T>` that calls `GetRequiredService` on the root provider keeps a scoped `T` for the process. Register `ILazy<>` as transient so it is built from the current scope, and do not inject `ILazy<ScopedService>` into a singleton. See [captive dependencies](AspNetCoreGuidance.md#avoid-capturing-scoped-services-in-singletons).
 
 ### Resolve by delegate (`Func<T>` / named delegates)
 
@@ -577,18 +583,30 @@ public sealed class CachedRepo(IRepo inner, IMemoryCache cache) : IRepo
         cache.GetOrCreateAsync(id, _ => inner.GetAsync(id, cancellationToken))!;
 }
 
-// After the real IRepo is registered:
-services.Decorate(); // Scrutor, or:
+// After the one IRepo registration. Scrutor: services.Decorate<IRepo, CachedRepo>().
+// By hand, copy the lifetime and build the inner from the captured descriptor.
+// GetRequiredService<IRepo>() here returns the decorator and recurses.
+var innerDescriptor = services.Last(d => d.ServiceType == typeof(IRepo));
+services.Add(ServiceDescriptor.Describe(
+    typeof(IRepo),
+    sp =>
+    {
+        IRepo inner;
+        if (innerDescriptor.ImplementationInstance is IRepo instance)
+            inner = instance;
+        else if (innerDescriptor.ImplementationFactory is { } factory)
+            inner = (IRepo)factory(sp);
+        else if (innerDescriptor.ImplementationType is { } type)
+            inner = (IRepo)ActivatorUtilities.CreateInstance(sp, type);
+        else
+            throw new InvalidOperationException("IRepo has no implementation.");
 
-var descriptor = services.Last(d => d.ServiceType == typeof(IRepo));
-services.AddSingleton<IRepo>(sp =>
-{
-    var inner = (IRepo)descriptor.ImplementationFactory!(sp);
-    return new CachedRepo(inner, sp.GetRequiredService<IMemoryCache>());
-});
+        return new CachedRepo(inner, sp.GetRequiredService<IMemoryCache>());
+    },
+    innerDescriptor.Lifetime));
 ```
 
-Keep the inner registration resolvable (factory or concrete) so you do not recurse.
+`ImplementationFactory` is null when the registration is `AddScoped<IRepo, SqlRepo>()`. That form stores `ImplementationType`. A decorator registered as singleton around a scoped `IRepo` is a captive dependency, so the new descriptor keeps `innerDescriptor.Lifetime`. This wraps a single registration. `GetServices<IRepo>()` then returns the original and the decorator.
 
 ### Open-generic handlers (strategy per `T`)
 
@@ -605,12 +623,14 @@ public sealed class CreateOrderHandler : ICommandHandler<CreateOrder, OrderId>
     public Task<OrderId> HandleAsync(CreateOrder command, CancellationToken cancellationToken) { /* ... */ }
 }
 
-services.AddTransient(typeof(ICommandHandler<,>), typeof(CreateOrderHandler));
-// or scan:
-// services.Scan(s => s.FromAssemblyOf<CreateOrderHandler>()
-//     .AddClasses(c => c.AssignableTo(typeof(ICommandHandler<,>)))
-//     .AsImplementedInterfaces());
+// Closed handler: the service type is closed too.
+services.AddTransient<ICommandHandler<CreateOrder, OrderId>, CreateOrderHandler>();
+
+// The open registration is only for an open implementation:
+// services.AddTransient(typeof(ICommandHandler<,>), typeof(LoggingHandler<,>));
 ```
+
+`AddTransient(typeof(ICommandHandler<,>), typeof(CreateOrderHandler))` throws. `CreateOrderHandler` is closed. It implements `ICommandHandler<CreateOrder, OrderId>`, not `ICommandHandler<TCommand, TResult>`. A scan that calls `AsImplementedInterfaces()` registers each closed pair. An open `LoggingHandler<TCommand, TResult>` is what you register against `typeof(ICommandHandler<,>)`.
 
 Dispatch:
 
@@ -660,6 +680,176 @@ public sealed class Binder(IServiceProviderIsService isService)
 ```
 
 Register nothing extra—the default provider implements this. Use it in libraries that optionally take a service if the app registered one.
+
+## Abstract, interface, and variance
+
+What you are allowed to substitute for what. The container looks up a **closed type**. Variance is a **compile-time assignment** rule on interfaces and delegates. It does not make `GetRequiredService<Base>()` return a registration of `Derived`.
+
+Classes, abstract classes, and structs are invariant. Only an **interface** or a **delegate** can say `out` (covariant) or `in` (contravariant).
+
+### The interface is what DI resolves
+
+An interface is a slot. Callers depend on `IOrderStore`. The app registers one or many implementations. A decorator can implement the same interface and take the inner one. A class can implement several interfaces, which is how [one instance is registered as `IFoo` and `IBar`](#single-implementation-multiple-interfaces).
+
+```C#
+public interface IOrderStore
+{
+    Task<Order?> GetAsync(OrderId id, CancellationToken cancellationToken);
+}
+
+services.AddScoped<IOrderStore, SqlOrderStore>();
+```
+
+Use an interface when the type is the thing other code **calls**, and when a second implementation (test double, cache decorator, composite) must exist. Do not add methods to that interface for one caller. A wide interface forces every decorator and every test double to implement the extra methods.
+
+### An abstract class owns the fixed steps
+
+An abstract class is a partial implementation. The base owns the steps that must not change. The subclass fills the step that does. `BackgroundService` owns start/stop and the stopping token. The subclass implements `ExecuteAsync`. `DelegatingHandler` owns the handler chain. The subclass implements `SendAsync`. `AuthenticationHandler<TOptions>` owns scheme plumbing. The subclass implements `HandleAuthenticateAsync`.
+
+```C#
+public abstract class Worker : BackgroundService
+{
+    protected abstract Task<int> RunOnceAsync(CancellationToken cancellationToken);
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await RunOnceAsync(stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+        }
+    }
+}
+```
+
+C# allows one base class. A store that inherits `OrderStoreBase` cannot also inherit `BackgroundService`, and a decorator cannot inherit the same base as the inner store. If the only shared thing is a method signature, that is an interface. If the base must run code before and after the subclass, that is an abstract class.
+
+#### ❌ BAD — abstract class as a marker
+
+```C#
+public abstract class ServiceBase
+{
+}
+
+public sealed class Orders : ServiceBase
+{
+}
+```
+
+Nothing is shared. The base only blocks a second base class. Use an interface, or no type at all.
+
+### Covariance (`out`)
+
+`out T` means "T only comes **out**." A producer of a more specific type is a producer of a more general type. `IEnumerable<out T>` is the one you already use. `IOptions<out TOptions>` and `Func<out TResult>` are the same shape. `ILogger<out TCategoryName>` is covariant too, even though the category name never appears on a member. The parameter exists so DI can give each class its own logger.
+
+```C#
+IEnumerable<string> names = new[] { "a" };
+IEnumerable<object> values = names; // string is an object, and the sequence only yields
+
+Func<string> label = () => "ok";
+Func<object> box = label;
+```
+
+A custom producer:
+
+```C#
+public interface IReader<out T>
+{
+    T Read();
+}
+
+public sealed class LineReader : IReader<string>
+{
+    public string Read() => "ok";
+}
+
+IReader<string> strings = new LineReader();
+IReader<object> objects = strings;
+```
+
+#### ❌ BAD — `out` and an input
+
+```C#
+public interface IReader<out T>
+{
+    T Read();
+    void Write(T value); // CS1961: T is covariant and appears as an input
+}
+```
+
+`Write` would let a caller pass an `object` into a reader that only stores `string`. The compiler rejects `out` as soon as `T` appears in an input position.
+
+Arrays are the old hole. `string[]` is convertible to `object[]`, and `objects[0] = 1` throws `ArrayTypeMismatchException` at runtime. `IEnumerable<out T>` does not have that hole because it has no write method.
+
+### Contravariance (`in`)
+
+`in T` means "T only goes **in**." A consumer of a more general type is a consumer of a more specific type. If a method can handle any `object`, it can handle a `string`. `Action<in T>`, `IComparer<in T>`, and `IEqualityComparer<in T>` are the BCL forms. Sort and dictionary code rely on the comparer version.
+
+```C#
+Action<object> write = value => Console.WriteLine(value);
+Action<string> writeString = write; // a writer of object accepts a string
+
+IComparer<object> byText = Comparer<object>.Create((a, b) =>
+    string.Compare(a?.ToString(), b?.ToString(), StringComparison.Ordinal));
+IComparer<string> byString = byText;
+```
+
+A custom consumer:
+
+```C#
+public interface ISink<in T>
+{
+    void Push(T value);
+}
+
+ISink<object> objects = new ConsoleSink();
+ISink<string> strings = objects;
+```
+
+#### ❌ BAD — `in` and an output
+
+```C#
+public interface ISink<in T>
+{
+    void Push(T value);
+    T Pull(); // CS1961: T is contravariant and appears as an output
+}
+```
+
+`Pull` would let a caller that asked for `ISink<string>` receive an `object` that is not a string.
+
+### Invariant is the default
+
+No keyword means T goes in **and** comes out, or it sits inside a type that is itself invariant. `IList<T>`, `ICollection<T>`, `DbSet<T>`, and `Task<T>` are invariant. `List<string>` is not a `List<object>`. A method that returns `Task<string>` is not a method that returns `Task<object>`.
+
+That is why the [command handler](#open-generic-handlers-strategy-per-t) in this guide is invariant:
+
+```C#
+public interface ICommandHandler<TCommand, TResult>
+{
+    Task<TResult> HandleAsync(TCommand command, CancellationToken cancellationToken);
+}
+```
+
+`in TCommand` would be legal on its own (`TCommand` is only an argument). `out TResult` is not legal on this method. `TResult` appears inside `Task<TResult>`, and `Task<T>` is a class, so that position is invariant. The compiler error is CS1961. `IAsyncEnumerable<out T>` can be covariant because that interface is declared `out T`. `Task<T>` cannot.
+
+The container does not apply these conversions. This assignment compiles. The resolve throws.
+
+```C#
+IReader<string> strings = new LineReader();
+IReader<object> objects = strings;
+
+services.AddSingleton<IReader<string>, LineReader>();
+sp.GetRequiredService<IReader<object>>(); // InvalidOperationException
+```
+
+Register the closed type you will resolve: `ICommandHandler<CreateOrder, OrderId>`, `ILogger<Orders>`, `IOptions<SmtpOptions>`. Variance matters when you already hold an instance and pass it to another method. It does not widen what `GetRequiredService` or `GetServices` will return.
+
+| Keyword | T appears as | You may assign | BCL |
+|---------|----------------|----------------|-----|
+| `out` | output only | specific → general | `IEnumerable<out T>`, `IOptions<out TOptions>`, `Func<out TResult>` |
+| `in` | input only | general → specific | `Action<in T>`, `IComparer<in T>`, `IEqualityComparer<in T>` |
+| (none) | both, or inside `Task<T>` / `IList<T>` | exact type only | `IList<T>`, `Task<T>`, `ICommandHandler<TCommand, TResult>` |
 
 ## Lifetimes, scopes, and tenancy
 
@@ -847,9 +1037,9 @@ public sealed class Orders(TenantContext tenant, TenantCache cache, IStore store
 
 Always prefix cache, log, and metric tags with `tenantId`. `HybridCache` / Redis: same key shape `tenant:{id}:order:{orderId}`.
 
-#### 4. Per-tenant clients (lazy singleton map)
+#### 4. Per-tenant calls on one named client
 
-When each tenant has a different base URL or API key, a singleton **factory** caches clients. Do not `new HttpClient()` per request.
+When each tenant has a different base URL or API key, create a client per call from one named registration. Do not `new HttpClient()` per request, and do not store the returned `HttpClient` in a dictionary. The factory rotates the handler; a cached instance keeps the first handler.
 
 ```C#
 public sealed class TenantHttpFactory(IHttpClientFactory factory, ITenantStore store)
@@ -859,7 +1049,6 @@ public sealed class TenantHttpFactory(IHttpClientFactory factory, ITenantStore s
         var info = store.Get(tenantId);
         var client = factory.CreateClient("tenant");
         client.BaseAddress = info.BaseAddress;
-        client.DefaultRequestHeaders.Remove("X-Api-Key");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-Api-Key", info.ApiKey);
         return client;
     }
@@ -867,8 +1056,11 @@ public sealed class TenantHttpFactory(IHttpClientFactory factory, ITenantStore s
 
 services.AddSingleton<ITenantStore, TenantStore>();
 services.AddSingleton<TenantHttpFactory>();
-services.AddHttpClient("tenant");
+services.AddHttpClient("tenant")
+    .RedactLoggedHeaders(header => header == "X-Api-Key");
 ```
+
+`Create` returns a new `HttpClient` each time. The caller uses it and drops it. Mutating `DefaultRequestHeaders` on an instance another thread still holds races. The API key is a header the logger should redact.
 
 If the tenant set is **fixed and small**, .NET 8 keyed services:
 
@@ -913,12 +1105,25 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TenantC
 
     public override int SaveChanges()
     {
+        StampTenant();
+        return base.SaveChanges();
+    }
+
+    public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        StampTenant();
+        return base.SaveChangesAsync(cancellationToken);
+    }
+
+    private void StampTenant()
+    {
         foreach (var e in ChangeTracker.Entries<Order>().Where(e => e.State == EntityState.Added))
             e.Entity.TenantId = TenantId;
-        return base.SaveChanges();
     }
 }
 ```
+
+The filter expression must use the context property (`TenantId`). EF parameterizes that member and re-reads it per query. A local copied in `OnModelCreating` (`var id = tenant.TenantId`) is baked into the cached model, so every later context filters as the first tenant. `SaveChangesAsync` is the method handlers call. Overriding only `SaveChanges` leaves new rows with an empty tenant id.
 
 `DbContext` stays **scoped**. Never a singleton. For background jobs, create a scope and set `TenantContext` from the **message**, not from `IHttpContextAccessor`.
 
@@ -996,6 +1201,8 @@ services.AddOptions<LibraryOptions>()
 ```
 
 `Configure` runs once when the options instance is created. For reloadable config, use `IOptionsMonitor<T>` / `IConfigureNamedOptions<T>` / `PostConfigure`. Do not inject `IConfiguration` into app services to read `config["Section:Key"]` — bind a POCO. See [Prefer `IOptions<T>`](AspNetCoreGuidance.md#prefer-ioptionst--ioptionsmonitort-over-iconfiguration).
+
+`Configure<ISomeService>` registers `IConfigureOptions<T>` as a singleton and resolves `ISomeService` from the root when that singleton is created. `ISomeService` must be a singleton. A scoped dependency there is a captive dependency.
 
 ### Named options, `IOptionsMonitor`, and `IOptionsSnapshot`
 
@@ -1099,7 +1306,7 @@ Typed: inject `DocsClient` (it takes `HttpClient` in the ctor). Named: `IHttpCli
 
 Do not `new HttpClient()` per request. See [Prefer `IHttpClientFactory`](AspNetCoreGuidance.md#prefer-ihttpclientfactory-over-new-httpclient).
 
-The factory sets `SocketsHttpHandler.PooledConnectionLifetime` to 2 minutes. If you `ConfigurePrimaryHttpMessageHandler`, set that property yourself or DNS will go stale. See [HttpClientGuidance.md](HttpClientGuidance.md).
+The factory rotates the handler on `HandlerLifetime` (default 2 minutes). That refresh is what picks up DNS. It does not set `PooledConnectionLifetime`. A typed client stored in a singleton keeps the first handler. See [HttpClientGuidance.md](HttpClientGuidance.md).
 
 ### `HttpMessageHandler` pipeline
 
@@ -1122,7 +1329,9 @@ services.AddHttpClient<OrdersClient>()
     .AddHttpMessageHandler<CorrelationHandler>();
 ```
 
-Handlers are typically **transient**; the factory pools the inner primary handler. Do not capture `HttpContext` beyond the request (see [AspNetCoreGuidance](AspNetCoreGuidance.md#do-not-capture-httpcontext-on-background-work)).
+Register the handler as transient so each pipeline gets its own instance, and leave `InnerHandler` null. The factory assigns the inner handler. A handler whose `InnerHandler` is already set throws when the pipeline is built.
+
+That instance then lives for `HandlerLifetime` (default 2 minutes) and is shared by every request in that window. It is not constructed per request. Read `IHttpContextAccessor` inside `SendAsync`. A field set from the accessor on one request is visible to the next request on the same handler. See [AspNetCoreGuidance](AspNetCoreGuidance.md#do-not-capture-httpcontext-on-background-work).
 
 ### Http resilience
 
@@ -1130,19 +1339,24 @@ Most production lists now use **Microsoft.Extensions.Http.Resilience** (or Polly
 
 ```C#
 services.AddHttpClient<OrdersClient>()
-    .AddStandardResilienceHandler(); // timeout, retry, circuit breaker, hedged retry defaults
+    .AddStandardResilienceHandler(); // total timeout, retry, circuit breaker, attempt timeout
 ```
+
+Hedging is `AddStandardHedgingHandler`, a separate call. It sends a second request while the first is still running. The standard handler does not do that.
 
 Tune:
 
 ```C#
 .AddStandardResilienceHandler(o =>
 {
+    o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(2);
     o.Retry.MaxRetryAttempts = 3;
-    o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(30);
+    o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(10);
     o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(10);
 });
 ```
+
+`SamplingDuration` must be at least twice `AttemptTimeout.Timeout`. A shorter sampling window fails options validation at startup. `TotalRequestTimeout` has to be long enough for the attempts you asked to retry. Ten seconds of total budget with a ten-second attempt timeout means the retry never runs.
 
 Prefer this on **idempotent** GETs. Do not blindly retry POST without idempotency keys.
 
@@ -1171,7 +1385,7 @@ public sealed class QueuedHostedService(IBackgroundTaskQueue queue) : Background
 }
 ```
 
-`ExecuteAsync` is not awaited by the host until shutdown—catch exceptions inside the loop. See [Channel + hosted services](AsyncGuidance.md#prefer-channelt-and-hosted-services-for-background-work).
+`StartAsync` returns when `ExecuteAsync` hits its first await, so the host can finish starting. The loop itself keeps running. An exception that leaves the loop faults the service. `HostOptions.BackgroundServiceExceptionBehavior` defaults to `StopHost` (.NET 6 and later): one bad item stops the process. Catch inside the loop when the queue should continue. See [Channel + hosted services](AsyncGuidance.md#prefer-channelt-and-hosted-services-for-background-work).
 
 .NET 8+ also has `IHostedLifecycleService` (`StartingAsync` / `StartedAsync` / `StoppingAsync` / `StoppedAsync`) for ordered startup.
 
@@ -1186,12 +1400,25 @@ services.AddSingleton(_ => Channel.CreateBounded<WorkItem>(new BoundedChannelOpt
 }));
 services.AddHostedService<WorkConsumer>();
 
-public sealed class WorkConsumer(Channel<WorkItem> channel) : BackgroundService
+public sealed class WorkConsumer(Channel<WorkItem> channel, ILogger<WorkConsumer> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await foreach (var item in channel.Reader.ReadAllAsync(stoppingToken))
-            await ProcessAsync(item, stoppingToken);
+        {
+            try
+            {
+                await ProcessAsync(item, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Work item failed");
+            }
+        }
     }
 }
 ```
@@ -1239,18 +1466,33 @@ public sealed class CorrelationStartupFilter : IStartupFilter
 services.TryAddEnumerable(ServiceDescriptor.Singleton<IStartupFilter, CorrelationStartupFilter>());
 ```
 
-Prefer explicit `app.UseCorrelation()` when the app should control order. Use `IStartupFilter` for defaults that must run around user middleware.
+Prefer explicit `app.UseCorrelation()` when the app should control order. The filter above runs **before** user middleware (`Use` then `next`). Call `next` first when the middleware must run after user middleware.
 
 ### Factory-activated `IMiddleware`
 
-Convention middleware (`app.Use`) is constructed per request via `ActivatorUtilities` (not DI-tracked). For middleware that needs **scoped** services, implement `IMiddleware` and register it in DI:
+Convention middleware (`UseMiddleware<T>`) is constructed **once**, when the pipeline is built. Constructor arguments come from the root provider. A scoped service in that constructor is a captive dependency, and scope validation throws in Development.
+
+Pass scoped services as parameters of `Invoke` / `InvokeAsync`. Those are resolved per request:
 
 ```C#
-public sealed class TenantMiddleware(ITenantContext tenant) : IMiddleware
+public sealed class TenantMiddleware(RequestDelegate next)
+{
+    public async Task InvokeAsync(HttpContext context, TenantContextHolder holder)
+    {
+        await next(context);
+    }
+}
+
+app.UseMiddleware<TenantMiddleware>();
+```
+
+`IMiddleware` is activated **per request** from DI, so scoped services can be constructor dependencies. Register it and still call `UseMiddleware<T>`:
+
+```C#
+public sealed class TenantMiddleware(TenantContextHolder holder) : IMiddleware
 {
     public async Task InvokeAsync(HttpContext context, RequestDelegate next)
     {
-        tenant.Bind(context);
         await next(context);
     }
 }
@@ -1259,7 +1501,7 @@ services.AddScoped<TenantMiddleware>();
 app.UseMiddleware<TenantMiddleware>();
 ```
 
-`IMiddlewareFactory` resolves it from the request scope and disposes it. This is what Microsoft uses when middleware is not a simple singleton.
+`IMiddlewareFactory` resolves that instance from the request scope and disposes it. If the type implements `IMiddleware` and is not registered, `UseMiddleware` throws. Convention middleware does not need a DI registration.
 
 ### Endpoint filters
 
@@ -1335,7 +1577,9 @@ services.AddProblemDetails();
 app.UseExceptionHandler();
 ```
 
-Returning `false` lets the next handler run. This is the in-box replacement for “middleware that catches Exception and writes JSON”.
+Returning `false` lets the next handler run. This is the in-box replacement for middleware that catches `Exception` and writes JSON.
+
+`OperationCanceledException` when `HttpContext.RequestAborted` is set means the client disconnected. Return `true` without writing a body, or let it fall through and the exception handler turns the disconnect into a 500. See [Flow `CancellationToken`](AspNetCoreGuidance.md#flow-cancellationtoken--requestaborted).
 
 ### `AuthenticationHandler<TOptions>` / `AuthorizationHandler<T>`
 
@@ -1377,7 +1621,7 @@ public sealed class MinAgeHandler : AuthorizationHandler<MinAgeRequirement>
 services.AddSingleton<IAuthorizationHandler, MinAgeHandler>();
 ```
 
-This is how **all** `Microsoft.AspNetCore.Authentication.*` packages plug in.
+The constructor above is the .NET 8+ one. `ISystemClock` was removed. Use `TimeProvider` on the handler when the scheme needs a clock.
 
 ### Rate limiter partitions
 
@@ -1487,7 +1731,7 @@ If you only insert both rows then call `SaveChanges` **once**, you do not need `
 
 #### 3. Retries: transaction **inside** the execution strategy
 
-SQL Server / Azure SQL retry on transient faults. A transaction opened **outside** `CreateExecutionStrategy().ExecuteAsync` will throw.
+SQL Server / Azure SQL retry on transient faults. A transaction opened **outside** `CreateExecutionStrategy().ExecuteAsync` throws. The delegate can run more than once, so it has to be safe to repeat. A failed attempt may already have tracked entities on this `DbContext`.
 
 ```C#
 var strategy = db.Database.CreateExecutionStrategy();
@@ -1734,7 +1978,7 @@ public static partial class Log
     public static partial void Handled(ILogger logger, string path, long elapsedMs);
 }
 
-Log.Handled(_logger, context.Request.Path, elapsed.ElapsedMilliseconds);
+Log.Handled(_logger, context.Request.Path.Value ?? "", elapsed.ElapsedMilliseconds);
 ```
 
 High-performance libraries in-box use this. `LoggerMessage.Define` is the older non-source-gen equivalent.
@@ -1798,11 +2042,11 @@ public class TokenService(TimeProvider time)
 {
     public DateTimeOffset ExpiresAt() => time.GetUtcNow().AddHours(1);
     public Task WaitAsync(TimeSpan delay, CancellationToken cancellationToken) =>
-        Task.Delay(delay, time, cancellationToken);
+        time.Delay(delay, cancellationToken);
 }
 ```
 
-In tests, pass `FakeTimeProvider`.
+In tests, pass `FakeTimeProvider` from the package `Microsoft.Extensions.TimeProvider.Testing`. `Task.Delay` has no `TimeProvider` argument. The delay a test can advance is `TimeProvider.Delay`.
 
 ### Object pooling
 
@@ -1865,7 +2109,8 @@ Kestrel, `System.Text.Json`, SignalR, and `HttpClient` write to [`IBufferWriter<
 PipeReader reader = context.Request.BodyReader;
 ReadResult result = await reader.ReadAsync(context.RequestAborted);
 ReadOnlySequence<byte> buffer = result.Buffer;
-// parse buffer ...
+// After a successful parse, consumed is the start of the unread remainder
+// and examined is the end of that remainder (including a partial frame).
 reader.AdvanceTo(consumed, examined);
 ```
 

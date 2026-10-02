@@ -16,6 +16,7 @@
   - [Flow `CancellationToken` / `RequestAborted`](#flow-cancellationtoken--requestaborted)
   - [Do not enable synchronous IO on Kestrel](#do-not-enable-synchronous-io-on-kestrel)
   - [Middleware: call `next` correctly](#middleware-call-next-correctly)
+    - [The endpoint is last on `WebApplication`](#the-endpoint-is-last-on-webapplication)
   - [Prefer `IHttpClientFactory` over `new HttpClient()`](#prefer-ihttpclientfactory-over-new-httpclient)
   - [Avoid `.Result` / async work inside DI registration](#avoid-result--async-work-inside-di-registration)
   - [Avoid `BuildServiceProvider()` inside `ConfigureServices`](#avoid-buildserviceprovider-inside-configureservices)
@@ -86,7 +87,10 @@ This guide is the HTTP-pipeline companion to [AsyncGuidance.md](AsyncGuidance.md
 | Read `Response` after `await next()` | `OnStarting`, or wrap the body **before** `next` |
 | `ArrayPool.Rent` without `Return` | `try`/`finally` return; don't over-rent |
 | `Stream` + `byte[]` loops for framing | `PipeReader` / `Request.BodyReader` |
-| Custom `SocketsHttpHandler` with no lifetime | `PooledConnectionLifetime` (factory default 2 min) |
+| `MinRequestBodyDataRate = null` to silence 408s | Leave 240 bytes/s; a debugger already skips the check |
+| Custom `SocketsHttpHandler` with no recycle | `HandlerLifetime` (factory default 2 min), or `PooledConnectionLifetime` on a long-lived handler |
+| Typed `HttpClient` captured by a singleton | `CreateClient` per call, or `PooledConnectionLifetime` |
+| Client abort logged as HTTP 500 | Return when `RequestAborted` is set |
 
 ## Avoid synchronous Read/Write on `HttpRequest.Body` and `HttpResponse.Body`
 
@@ -166,13 +170,16 @@ Prefer:
 - `[FromBody]` / `JsonSerializer.DeserializeAsync` (stream)
 - `Request.Body.CopyToAsync(destination)` to a file or pipe
 - `IAsyncEnumerable<T>` / `JsonSerializer.SerializeAsync` for large responses
+- `IHttpResponseBodyFeature.DisableBuffering()` before the first write when the response is a stream (server-sent events, a file) and Kestrel must not hold it for the minimum data rate
 - `ArrayPool<byte>` / `PipeReader` (`Request.BodyReader`) for manual framing
 
 ❌ **BAD** Entire body as `string` / `byte[]`.
 
 ```C#
 var json = await new StreamReader(Request.Body).ReadToEndAsync();
-var bytes = await Request.Body.ReadAllBytes(); // same problem
+await using var copy = new MemoryStream();
+await Request.Body.CopyToAsync(copy);
+var bytes = copy.ToArray(); // same problem: the whole body is a byte[]
 ```
 
 :white_check_mark: **GOOD** Stream to disk or deserialize incrementally.
@@ -225,7 +232,17 @@ If you **must** use Newtonsoft, still read the stream asynchronously (`JsonTextR
 
 Streaming does not make unbounded bodies safe. Kestrel and form limits exist so one client cannot fill the disk or LOH.
 
-Defaults (check your version): Kestrel `MaxRequestBodySize` is 30MB; form options have their own caps (`MultipartBodyLengthLimit`, `ValueCountLimit`).
+Defaults on current Kestrel: `MaxRequestBodySize` is **30,000,000 bytes** (about 28.6 MB), not a round 30 MiB. `MinRequestBodyDataRate` and `MinResponseDataRate` are **240 bytes/second** with a **5 second** grace. Form defaults are separate: `ValueCountLimit` **1024**, `ValueLengthLimit` **4,194,304**, `KeyLengthLimit` **2048**, `MultipartBodyLengthLimit` **128 MB**. The multipart cap is larger than Kestrel's body cap, so Kestrel rejects first unless you raised `MaxRequestBodySize`.
+
+`ValueCountLimit` is the form-field DoS cap. A body under 30,000,000 bytes can still carry more than 1024 fields. Raising the body limit does not raise the field limit.
+
+Out-of-process behind IIS, the ASP.NET Core Module turns Kestrel's body limit off. The limit that applies is IIS `maxAllowedContentLength`. `[DisableRequestSizeLimit]` on a public endpoint removes the cap: pair it with auth, a quota, or streaming to blob storage.
+
+`IHttpMaxRequestBodySizeFeature.MaxRequestBodySize` throws if you set it after the body has been read. Check `IsReadOnly` first.
+
+Do not set `MinRequestBodyDataRate` or `MinResponseDataRate` to `null` to stop 408s. That check is what drops a client that trickles forever (Slowloris). With synchronous IO still enabled, that trickle also holds a thread-pool thread. A debugger already skips these rate limits, plus `KeepAliveTimeout` and `RequestHeadersTimeout`, so a timeout you cannot reproduce under the debugger is often this check. Per-request response-rate overrides are not available on HTTP/2; clearing the server limit clears it for every connection.
+
+Body size does not cap how many requests a client opens. `AddRateLimiter` is that other limit. This guide does not design the policy.
 
 ```C#
 builder.WebHost.ConfigureKestrel(options =>
@@ -248,7 +265,7 @@ Per endpoint:
 public async Task<IActionResult> Upload(IFormFile file) { /* ... */ }
 ```
 
-❌ **BAD** `[DisableRequestSizeLimit]` on a public endpoint with no auth, quota, or streaming-to-blob strategy.
+❌ **BAD** `MinRequestBodyDataRate = null` (and the response twin) to silence 408s. Slow clients then hold connections until the server is full.
 
 :hammer: **Hands-on** POST a body larger than the limit. You should get `413 Payload Too Large`, not an OOM.
 
@@ -491,9 +508,9 @@ app.Use(async (context, next) =>
 });
 ```
 
-Check `context.Response.HasStarted` before mutating status/headers. Do not use `HasStarted` as a substitute for `OnStarting` when you need a header on every response that *does* write.
+Check `context.Response.HasStarted` before mutating status/headers. After `HasStarted`, Kestrel throws `InvalidOperationException` on status, headers, and cookies. Do not use `HasStarted` as a substitute for `OnStarting` when you need a header on every response that *does* write. Register `OnStarting` before the first write. Registering it after `HasStarted` throws.
 
-:hammer: **Hands-on** `WriteAsync` then set `StatusCode = 500`. Throws or no-ops. Register `OnStarting` before `next()` and the header appears on the wire (`curl -v`).
+:hammer: **Hands-on** `WriteAsync` then set `StatusCode = 500`. Kestrel throws `InvalidOperationException`. Register `OnStarting` before `next()` and the header appears on the wire (`curl -v`).
 
 ## Flow `CancellationToken` / `RequestAborted`
 
@@ -538,6 +555,24 @@ app.MapGet("/report", async (AppDbContext db, CancellationToken cancellationToke
 
 Do **not** pass `RequestAborted` into work that must outlive the request (that's the hosted-service case). Use `CancellationToken.None` or the host's `IHostApplicationLifetime.ApplicationStopping` there.
 
+A client hang-up surfaces as `OperationCanceledException` / `TaskCanceledException` from EF, `HttpClient`, or `ReadAsync`. That is not a failed request. Mapping every exception to HTTP 500 logs a storm and tries to write a body after the connection is gone.
+
+```C#
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next(context);
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+        // Client gone. Do not set 500 and do not write.
+    }
+});
+```
+
+An `OperationCanceledException` whose token is **not** `RequestAborted` (your own timeout, a linked CTS) is still a real failure. The `when` filter is the difference.
+
 See [Always flow CancellationToken](AsyncGuidance.md#always-flow-cancellationtokens-to-apis-that-take-a-cancellationtoken).
 
 :hammer: **Hands-on** `await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken)` then cancel the client (`curl` Ctrl+C). With the token, the action ends immediately; without it, the delay runs to 30s (watch with logging).
@@ -550,6 +585,8 @@ builder.WebHost.ConfigureKestrel(o => o.AllowSynchronousIO = true);
 ```
 
 This was a common "fix" when JSON.NET or old libraries called `Stream.Read`. It puts starvation back on the table. Prefer async serializers and `[FromBody]`.
+
+In-process IIS has its own switch, `IISServerOptions.AllowSynchronousIO`, also false by default. Setting only the Kestrel flag leaves IIS throwing, and setting only the IIS flag leaves Kestrel throwing. Leave both false.
 
 :hammer: **Hands-on** Sync `ReadToEnd` with default Kestrel: `InvalidOperationException`. Setting `AllowSynchronousIO = true` makes it "work" and will stall under `ab -c 50` with slow bodies.
 
@@ -606,7 +643,27 @@ app.Use(async (context, next) =>
 - Do not swallow exceptions without rethrowing or writing a completed error response.
 - `return next(context)` without `await` is fine only if you have no code after it.
 
-:hammer: **Hands-on** Log `HasStarted` before and after `await next(context)` on a controller that returns `Ok("hi")`. After `next`, `HasStarted` is true. Call `next` twice and watch the action log two hits.
+### The endpoint is last on `WebApplication`
+
+`WebApplication` inserts `UseRouting` before your middleware and `UseEndpoints` after it. `app.Use` written below `app.MapGet` still runs before the endpoint. A header set after `await next()` is already too late once the endpoint has written.
+
+A `Run` placed after `MapGet`, with no explicit `UseEndpoints`, is not where unmatched requests land. Terminal middleware (no endpoint handled this request) goes **after** `UseEndpoints`:
+
+```C#
+app.UseRouting();
+app.MapGet("/", () => "hello world");
+app.UseEndpoints(_ => { });
+
+app.Run(context =>
+{
+    context.Response.StatusCode = StatusCodes.Status404NotFound;
+    return Task.CompletedTask;
+});
+```
+
+Middleware that must run **before** routing (correlation id, request logging that should see unmatched paths the same way) goes before an explicit `UseRouting()`.
+
+:hammer: **Hands-on** Log `HasStarted` before and after `await next(context)` on a controller that returns `Ok("hi")`. After `next`, `HasStarted` is true. Call `next` twice and watch the action log two hits. Register a second `Use` under `MapGet` and confirm it still logs before the action, not after.
 
 ## Prefer `IHttpClientFactory` over `new HttpClient()`
 
@@ -645,18 +702,22 @@ public class PokemonService(HttpClient client)
 }
 ```
 
-Factory-created clients should **not** be disposed by you in a way that disposes the handler (do not wrap `CreateClient()` in `using`—prefer typed clients).
+Factory-created clients are safe to dispose. `using` around `CreateClient()` does not dispose the pooled handler. `using` around `new HttpClient()` does. Do not dispose the `HttpClient` injected into a typed client: later calls on that same instance throw `ObjectDisposedException`. The factory disposes the handler when its lifetime ends and nothing is still using it.
 
-`IHttpClientFactory` sets [`SocketsHttpHandler.PooledConnectionLifetime`](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.socketshttphandler.pooledconnectionlifetime) to **2 minutes** so DNS changes are picked up. A process-wide `static HttpClient` never does. If you **replace** the primary handler, you must set the lifetime yourself—the factory default is gone.
+`IHttpClientFactory` caches one handler per client name and replaces it on [`HandlerLifetime`](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.dependencyinjection.httpclientfactoryoptions.handlerlifetime) (default **2 minutes**). That rotation is what picks up DNS changes. The factory does **not** set [`SocketsHttpHandler.PooledConnectionLifetime`](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.socketshttphandler.pooledconnectionlifetime). A process-wide `static HttpClient` never rotates its handler, so set `PooledConnectionLifetime` there.
+
+`AddHttpClient<PokemonService>` registers `PokemonService` as **transient**. A singleton that takes `PokemonService` (or `HttpClient`) in its constructor keeps the first handler for the process, and DNS stays stale. Inject `IHttpClientFactory` and call `CreateClient` per operation.
+
+When the client must be long-lived, recycle connections on the handler and stop the factory from rotating that same handler:
 
 ```C#
 builder.Services.AddHttpClient("github")
-    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-    {
-        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1)
-    });
+    .UseSocketsHttpHandler((handler, _) =>
+        handler.PooledConnectionLifetime = TimeSpan.FromMinutes(2))
+    .SetHandlerLifetime(Timeout.InfiniteTimeSpan);
 ```
+
+`ConfigurePrimaryHttpMessageHandler` still rotates on `HandlerLifetime` unless you set that lifetime to infinite. The 2-minute figure is the factory's handler rotation, not a property the factory writes onto `SocketsHttpHandler`.
 
 A long-lived `HttpClient` **not** created by the factory:
 
@@ -745,9 +806,9 @@ See [Do not share non-thread-safe state](AsyncGuidance.md#do-not-share-non-threa
 
 ## Avoid `EnableBuffering` unless you must reread the body
 
-`Request.EnableBuffering()` lets middleware read the body and then rewind for model binding. It **buffers the whole body into memory** (disk after a threshold on some versions). Doing it globally reintroduces the large-body DoS.
+`Request.EnableBuffering()` lets middleware read the body and then rewind so model binding can read it again. The call itself does not read. It wraps `Request.Body` in a seekable stream that buffers **as something reads**. The default memory threshold is 30 KB (`1024 * 30`); past that, the rest spills to a temp file. The default `bufferLimit` is unlimited, so a logging middleware that reads the whole body will fill the disk.
 
-❌ **BAD**
+❌ **BAD** Global wrap, no limit. Anything downstream that reads (model binding included) buffers the entire body with no cap.
 
 ```C#
 app.Use(async (context, next) =>
@@ -757,18 +818,18 @@ app.Use(async (context, next) =>
 });
 ```
 
-:white_check_mark: **GOOD** Enable only for the endpoints that need it, then rewind, and keep size limits.
+:white_check_mark: **GOOD** Enable only on the endpoints that must reread, pass a `bufferLimit`, then rewind. `Position = 0` works only because the wrapper is seekable.
 
 ```C#
-context.Request.EnableBuffering();
+context.Request.EnableBuffering(bufferThreshold: 1024 * 30, bufferLimit: 1_000_000);
 await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
 context.Request.Body.Position = 0;
 await next();
 ```
 
-Prefer `IHttpRequestBodyDetectionFeature` / endpoint filters / `[FromBody]` instead of a global buffer.
+`IHttpRequestBodyDetectionFeature.CanHaveBody` tells you whether a body can exist. It does not replace the rewind. Prefer `[FromBody]` or an endpoint filter when you do not need the raw bytes yourself.
 
-:hammer: **Hands-on** Global `EnableBuffering` + 30MB POST: memory tracks the body even if the action never reads it.
+:hammer: **Hands-on** `EnableBuffering()` and an action that never reads: memory stays flat. Add a middleware that `CopyToAsync`s the body, rewind, then POST 30 MB: the process memory or the temp directory tracks the body. Set `bufferLimit` and the oversize request fails instead of growing.
 
 ## Avoid unbounded static caches
 
@@ -909,11 +970,11 @@ public sealed class Mailer(IOptions<SmtpOptions> options)
 }
 ```
 
-When settings **reload** (file, Key Vault, feature flags), inject **`IOptionsMonitor<T>`** (singleton-safe, `OnChange`) instead of `IOptions<T>` (frozen at first resolve). `IOptionsSnapshot<T>` is the per-request view. See [named options](DotnetPattern.md#named-options-ioptionsmonitor-and-ioptionssnapshot).
+When settings **reload** (file, Key Vault, feature flags), inject **`IOptionsMonitor<T>`** (singleton-safe, `OnChange`) instead of `IOptions<T>` (frozen at first resolve). `IOptionsSnapshot<T>` is the per-request view and is scoped. Injecting it into a singleton is a captive dependency (`ValidateScopes` throws in Development). See [named options](DotnetPattern.md#named-options-ioptionsmonitor-and-ioptionssnapshot).
 
 ## Prefer `TimeProvider` over `DateTime.UtcNow`
 
-`DateTime.UtcNow` / `DateTimeOffset.UtcNow` are not fakeable. Inject [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider) (`TimeProvider.System` in production, `FakeTimeProvider` in tests).
+`DateTime.UtcNow` / `DateTimeOffset.UtcNow` are not fakeable. Inject [`TimeProvider`](https://learn.microsoft.com/en-us/dotnet/api/system.timeprovider) (`TimeProvider.System` in production, `FakeTimeProvider` from the package `Microsoft.Extensions.TimeProvider.Testing` in tests).
 
 ```C#
 builder.Services.AddSingleton(TimeProvider.System);
@@ -1043,12 +1104,37 @@ app.Use(async (context, next) =>
 {
     await next(context);
     var status = context.Response.StatusCode;           // maybe ok
-    context.Response.Headers["X-Done"] = "1";           // often throws / no-op
+    context.Response.Headers["X-Done"] = "1";           // throws after HasStarted
     var body = await new StreamReader(context.Response.Body).ReadToEndAsync(); // not rewindable
 });
 ```
 
-:white_check_mark: **GOOD** Mutate **before** `next`, or `OnStarting` (headers only). To capture a body, replace `Response.Body` with a limited buffer **before** `next`, then copy out—never as a global middleware without a size cap (see [EnableBuffering](#avoid-enablebuffering-unless-you-must-reread-the-body)).
+:white_check_mark: **GOOD** Mutate **before** `next`, or `OnStarting` (headers only). To capture a body, replace `Response.Body` with a **size-capped** buffer **before** `next`, copy to the original stream, and put the original back in `finally`. Leaving your stream in place means the client gets an empty body, and a pooled `HttpContext` can hand that stream to the next request.
+
+```C#
+app.Use(async (context, next) =>
+{
+    var original = context.Response.Body;
+    await using var buffer = new MemoryStream();
+    context.Response.Body = buffer;
+    try
+    {
+        await next(context);
+        if (buffer.Length > 64 * 1024)
+            throw new InvalidOperationException("Response capture cap is 64 KB.");
+
+        context.Response.Body = original;
+        buffer.Position = 0;
+        await buffer.CopyToAsync(original, context.RequestAborted);
+    }
+    finally
+    {
+        context.Response.Body = original;
+    }
+});
+```
+
+That still buffers, and it breaks streaming endpoints (`IAsyncEnumerable<T>`, file results). Do not install it globally. For a header on every response, `OnStarting` does not touch the body:
 
 ```C#
 app.Use(async (context, next) =>
@@ -1078,26 +1164,48 @@ var payload = new byte[len];
 _ = await Request.Body.ReadAsync(payload, cancellationToken);
 ```
 
-`ReadAsync` can return partial buffers; this also copies every frame.
+`ReadAsync` can return fewer bytes than the array length. A client-supplied `len` with no cap is an allocation DoS. This also copies every frame.
 
-:white_check_mark: **GOOD**
+:white_check_mark: **GOOD** `TryParseFrame` slices `buffer` to the unread remainder when it returns true. After the loop, `consumed` is the start of that remainder and `examined` is its end, so a partial frame is looked at and not consumed. One `AdvanceTo(buffer.Start, buffer.End)` for both outcomes either retries a frame you already parsed or never records that you are waiting for more bytes.
 
 ```C#
 var reader = context.Request.BodyReader;
-while (!context.RequestAborted.IsCancellationRequested)
+while (true)
 {
     var result = await reader.ReadAsync(context.RequestAborted);
     var buffer = result.Buffer;
-    if (TryParseFrame(ref buffer, out var frame))
-        reader.AdvanceTo(buffer.Start, buffer.End);
-    else
-        reader.AdvanceTo(buffer.Start, buffer.End); // examined, need more
+    var consumed = buffer.Start;
+    var examined = buffer.End;
 
-    if (result.IsCompleted) break;
+    try
+    {
+        while (TryParseFrame(ref buffer, out var frame))
+            Process(frame);
+
+        consumed = buffer.Start;
+        examined = buffer.End;
+
+        if (result.IsCompleted)
+            break;
+    }
+    finally
+    {
+        reader.AdvanceTo(consumed, examined);
+    }
 }
 ```
 
-Always `AdvanceTo(consumed, examined)`. Do not `Complete()` the request pipe unless you own it. See [`IBufferWriter` / `PipeReader`](DotnetPattern.md#ibufferwritert--pipereader).
+`Advance` on a writer is the count you wrote, which can be smaller than `GetSpan`:
+
+```C#
+var writer = context.Response.BodyWriter;
+var span = writer.GetSpan(4);
+BinaryPrimitives.WriteInt32BigEndian(span, length);
+writer.Advance(4);
+await writer.FlushAsync(context.RequestAborted);
+```
+
+Always `AdvanceTo(consumed, examined)` once per `ReadAsync`. Do not `Complete()` the request pipe or `Response.BodyWriter`; Kestrel owns them. See [`IBufferWriter` / `PipeReader`](DotnetPattern.md#ibufferwritert--pipereader).
 
 # Related guides
 

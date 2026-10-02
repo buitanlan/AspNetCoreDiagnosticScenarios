@@ -1308,7 +1308,7 @@ public sealed class HttpPriceList(HttpClient http) : IPriceList
 {
     public async Task<ProductOffer?> FindAsync(ProductId productId, CancellationToken cancellationToken)
     {
-        using var response = await http.GetAsync($"/products/{productId.Value}", cancellationToken);
+        using var response = await http.GetAsync($"products/{productId.Value}", cancellationToken);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             return null;
         response.EnsureSuccessStatusCode();
@@ -1323,7 +1323,7 @@ public sealed class HttpPriceList(HttpClient http) : IPriceList
 }
 ```
 
-`CatalogProductBody` is private to the adapter. `PlaceOrderHandler` never sees it. `Money`'s constructor still rejects a negative amount and a bad currency, so a catalog bug fails at the edge of the inside instead of being stored on a line. Register the client the way [HttpClientGuidance.md](HttpClientGuidance.md) describes. Do not `new HttpClient()` inside `FindAsync`.
+`CatalogProductBody` is private to the adapter. `PlaceOrderHandler` never sees it. `Money`'s constructor still rejects a negative amount and a bad currency, so a catalog bug fails at the edge of the inside instead of being stored on a line. `BaseAddress` ends with `/` and the relative URI does not start with `/`. A leading slash drops a path prefix on the base. See [BaseAddress](HttpClientGuidance.md#baseaddress-and-the-relative-uri). Do not `new HttpClient()` inside `FindAsync`.
 
 ```C#
 public static IServiceCollection AddCatalogPriceList(
@@ -1332,10 +1332,14 @@ public static IServiceCollection AddCatalogPriceList(
 {
     if (configuration.GetValue("Catalog:Mode", "Database") == "Http")
     {
+        var baseUrl = configuration["Catalog:BaseUrl"]
+            ?? throw new InvalidOperationException("Catalog:BaseUrl is missing.");
+        if (!baseUrl.EndsWith('/'))
+            baseUrl += "/";
+
         services.AddHttpClient<HttpPriceList>(client =>
         {
-            client.BaseAddress = new Uri(configuration["Catalog:BaseUrl"]
-                ?? throw new InvalidOperationException("Catalog:BaseUrl is missing."));
+            client.BaseAddress = new Uri(baseUrl);
         });
         services.AddScoped<IPriceList>(sp => sp.GetRequiredService<HttpPriceList>());
     }
@@ -1369,7 +1373,7 @@ public sealed class StripePaymentGateway(HttpClient http) : IPaymentGateway
             metadata = new { orderId = orderId.Value }
         };
 
-        using var response = await http.PostAsJsonAsync("/v1/payment_intents", body, cancellationToken);
+        using var response = await http.PostAsJsonAsync("v1/payment_intents", body, cancellationToken);
         response.EnsureSuccessStatusCode();
     }
 }
@@ -1944,16 +1948,20 @@ public sealed class StockConfiguration : IEntityTypeConfiguration<Stock>
 
 A tenant filter and a soft-delete filter are infrastructure. They are also easy to get wrong. The `Order` in this guide has no `TenantId` until you add one; the filter below is the shape after that property exists.
 
+#### ❌ BAD — the first tenant is compiled into the model
+
 ```C#
-builder.HasQueryFilter(o => o.TenantId == _tenantId);
+var tenantId = _tenant.TenantId;
+builder.HasQueryFilter(o => o.TenantId == tenantId);
 ```
 
-`_tenantId` must come from a scoped tenant accessor evaluated per query, not from a value copied once when the model was built. EF Core supports this when the filter closes over a property on the `DbContext`:
+`tenantId` is a local. EF bakes that value into the cached model, and every later context filters as whichever tenant built the model first.
+
+:white_check_mark: **GOOD** Close over a property of this `DbContext`. EF parameterizes it and reads it again on each query.
 
 ```C#
 public Guid CurrentTenantId => _tenant.TenantId;
 
-// in Configure:
 builder.HasQueryFilter(o => o.TenantId == CurrentTenantId);
 ```
 
@@ -3180,6 +3188,7 @@ public sealed class OrderSagaMachine : MassTransitStateMachine<OrderSaga>
         During(Paid,
             Ignore(OrderPlaced),
             Ignore(PaymentCaptured),
+            Ignore(PaymentFailed),
             Ignore(PaymentTimeout.Received));
 
         During(PaymentFailed,
@@ -3194,7 +3203,7 @@ public sealed class OrderSagaMachine : MassTransitStateMachine<OrderSaga>
 
 `OrderPlacedV1` already has `Total` and `Currency`. The saga copies them onto `RequestPayment` and does not read the `orders` table. A capture that arrives after the timeout finds `PaymentFailed` and publishes `RefundRequired`, not `PayOrder`. That is the same incident as [a payment process](#a-payment-process): the money moved, the order did not. Returning the message to the queue will not make `MarkPaid` legal.
 
-`Ignore(OrderPlaced)` while waiting drops a second event for the same order. The inbox on the publisher already dedupes by `EventId`. The ignore is the backstop.
+`Ignore(OrderPlaced)` while waiting drops a second event for the same order. The inbox on the publisher already dedupes by `EventId`. The ignore is the backstop. `Ignore(PaymentFailed)` while `Paid` drops a late failure. Handling it would publish `FailOrderPayment` and release stock on an order that already took money. An unhandled event faults the endpoint and retries until the message dead-letters.
 
 The saga row moves to `Paid` when `PayOrder` is published, not when `MarkPaid` commits. `PayOrderConsumer` retries. The handler is idempotent, so a redelivery finishes the order. A dead-letter leaves the saga on `Paid` and the order on `Placed`. That pair is an incident, the same shape as a refund. Do not call `MarkPaid` inside `.Then` to hide it.
 
@@ -3233,7 +3242,7 @@ new OrderSagaMap().Configure(modelBuilder);
 
 One pipe publishes `OrderPlacedV1` through your worker. The saga's `RequestPayment`, `PayOrder`, and `FailOrderPayment` go through the MassTransit outbox. Publishing `OrderPlacedV1` from both pipes delivers it twice. The inbox hides the duplicate and you still did the work twice on the way out.
 
-`UsePostgres()` on the saga repository takes `FOR UPDATE` on the saga row for the consume. Two `PaymentCaptured` deliveries cannot both transition `AwaitingPayment`. SQL Server is `UseSqlServer()` on that same repository and on the outbox. The saga repository and the outbox must use this `OrderingDbContext`. A second context commits the saga insert and the `RequestPayment` row separately. Do not wrap the two contexts in a `TransactionScope` to fake one commit.
+`UsePostgres()` only installs the `FOR UPDATE` statement. The repository's default concurrency mode is optimistic, and that statement is unused until the mode is pessimistic. Two `PaymentCaptured` deliveries can both read `AwaitingPayment` and the second commit overwrites the first. Optimistic mode needs `ISagaVersion` (`int Version` on the saga). Leaving the default and also skipping the version property means there is no token. The registration below sets `ConcurrencyMode.Pessimistic`. SQL Server is `UseSqlServer()` on that same repository and on the outbox. The saga repository and the outbox must use this `OrderingDbContext`. A second context commits the saga insert and the `RequestPayment` row separately. Do not wrap the two contexts in a `TransactionScope` to fake one commit.
 
 ```C#
 public sealed class OrderSagaMap : SagaClassMap<OrderSaga>
@@ -3268,10 +3277,6 @@ public sealed class OrderSagaDefinition : SagaDefinition<OrderSaga>
         ISagaConfigurator<OrderSaga> saga,
         IRegistrationContext context)
     {
-        endpoint.UseMessageRetry(retry => retry.Intervals(
-            TimeSpan.FromMilliseconds(200),
-            TimeSpan.FromSeconds(1),
-            TimeSpan.FromSeconds(5)));
         endpoint.UseEntityFrameworkOutbox<OrderingDbContext>(context);
     }
 }
@@ -3283,6 +3288,7 @@ services.AddMassTransit(bus =>
         {
             repository.ExistingDbContext<OrderingDbContext>();
             repository.UsePostgres();
+            repository.ConcurrencyMode = ConcurrencyMode.Pessimistic;
         });
 
     bus.AddConsumer<PayOrderConsumer>();
@@ -3313,7 +3319,7 @@ services.AddMassTransit(bus =>
 });
 ```
 
-`PayOrderConsumer` and `FailOrderPaymentConsumer` do not need `UseEntityFrameworkOutbox`. The handlers write `OrderPaid` and `OrderPaymentFailed` through your interceptor into `outbox_messages`. A second outbox on that consumer would be for bus publishes the handler does not make.
+`PayOrderConsumer` and `FailOrderPaymentConsumer` do not need `UseEntityFrameworkOutbox`. The handlers write `OrderPaid` and `OrderPaymentFailed` through your interceptor into `outbox_messages`. A second outbox on that consumer would be for bus publishes the handler does not make. Retry lives on the endpoint callback once. Adding `UseMessageRetry` again inside `OrderSagaDefinition` stacks a second retry policy on the saga.
 
 ## Testing
 
