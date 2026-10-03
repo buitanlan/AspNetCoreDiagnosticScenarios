@@ -4,6 +4,7 @@
   - [How to read this](#how-to-read-this)
   - [They are not the same thing](#they-are-not-the-same-thing)
   - [Strategic design](#strategic-design)
+    - [Subdomains and investment](#subdomains-and-investment)
     - [Ubiquitous language](#ubiquitous-language)
     - [Bounded contexts](#bounded-contexts)
     - [Context map](#context-map)
@@ -22,7 +23,7 @@
   - [Where a rule lives](#where-a-rule-lives)
     - [The same rule in three layers](#the-same-rule-in-three-layers)
     - [Uniqueness is a constraint, not a method](#uniqueness-is-a-constraint-not-a-method)
-    - [Authorization is not a domain rule](#authorization-is-not-a-domain-rule)
+    - [Authorization and business permissions](#authorization-and-business-permissions)
   - [The dependency rule](#the-dependency-rule)
     - [Allowed references](#allowed-references)
     - [The host is the composition root](#the-host-is-the-composition-root)
@@ -52,7 +53,7 @@
     - [One DbContext per bounded context](#one-dbcontext-per-bounded-context)
     - [Mapping](#mapping)
     - [Value converters](#value-converters)
-    - [Backing fields and owned lines](#backing-fields-and-owned-lines)
+    - [Backing fields and child lines](#backing-fields-and-child-lines)
     - [Concurrency token](#concurrency-token)
     - [Global query filters](#global-query-filters)
     - [Repository](#repository)
@@ -91,9 +92,11 @@
   - [Testing](#testing)
     - [Aggregate tests](#aggregate-tests)
     - [Handler tests](#handler-tests)
+    - [Integration and failure tests](#integration-and-failure-tests)
     - [Architecture test](#architecture-test)
   - [Tenancy and time](#tenancy-and-time)
     - [Tenant comes from the host, not the body](#tenant-comes-from-the-host-not-the-body)
+    - [Tenant isolation also applies to writes and messages](#tenant-isolation-also-applies-to-writes-and-messages)
     - [Time and ids are inputs](#time-and-ids-are-inputs)
   - [Modular monolith](#modular-monolith)
     - [One process, many modules](#one-process-many-modules)
@@ -116,6 +119,7 @@
     - [Two writers, one row](#two-writers-one-row)
   - [What to skip](#what-to-skip)
   - [Checklist](#checklist)
+  - [Primary references](#primary-references)
   - [Related guides](#related-guides)
 
 # DDD and Clean Architecture
@@ -133,7 +137,7 @@ The running example is an ordering bounded context:
 - publish `ordering.order_placed.v1` after the row commits
 - let a payment message move the order to paid, or release the stock when payment fails
 
-The sample targets .NET 9 (`Guid.CreateVersion7`, primary constructors, `TimeProvider`, EF Core 8+ `ComplexProperty`). Identity types are shown in full below; the shorter treatment and model binding notes also live in [DotnetPattern.md](DotnetPattern.md#strongly-typed-ids).
+The main examples target .NET 10, EF Core 10, and the Npgsql PostgreSQL provider. `Guid.CreateVersion7` requires .NET 9+; primary constructors and `TimeProvider` require .NET 8+. .NET 10 is the LTS baseline for new work here; consult the [official support policy](https://dotnet.microsoft.com/en-us/platform/support/policy) before choosing a runtime. These are teaching excerpts: alternative architectures reuse type names and must not be pasted into one project together. Registration, authentication, migrations, and transport setup must be completed for a runnable application. Identity types are shown below; see also [DotnetPattern.md](DotnetPattern.md#strongly-typed-ids).
 
 ## How to read this
 
@@ -166,6 +170,18 @@ Tactical patterns (entity, value object, aggregate, repository, domain event) ar
 
 ## Strategic design
 
+### Subdomains and investment
+
+A **subdomain** is part of the business problem; a **bounded context** is the boundary of a particular software model. They often align, but are not synonyms or automatically one-to-one. Work with domain experts to identify the core capability and its language before choosing projects.
+
+| Subdomain | Investment | Example |
+|-----------|------------|---------|
+| Core | Model the differentiating rules carefully | A specialized order-allocation policy that competitors cannot easily copy |
+| Supporting | Build enough to support the core | An internal product-maintenance screen |
+| Generic | Prefer an established solution when its model fits | Authentication, commodity payment processing |
+
+Not every bounded context needs a rich aggregate, a saga, or the same architecture. Map ownership, invariants, business events, and integration needs first; a database schema diagram alone will not identify a context.
+
 ### Ubiquitous language
 
 The names in the code are the names the business uses for this context. If support says "we cancel a placed order" and "we void a paid order", those are two transitions, not one `Status = "Cancelled"` flag with a comment.
@@ -179,7 +195,7 @@ Write the words into types and methods:
 | Capture payment | `Order.MarkPaid` | `order.IsPaid = true` |
 | Ship | `Order.Ship` | `UPDATE orders SET status = 3` |
 
-A glossary markdown file that the code does not use is not ubiquitous language. The compiler is the glossary. `OrderStatus.Paid` is a word. `"P"` in a `char` column is a private joke the next reader will not get. Map the short column in EF (`HasConversion<string>()`), and keep the enum name as the word.
+A glossary markdown file that the code does not use is not ubiquitous language. The glossary, conversations, tests, and code should agree. `OrderStatus.Paid` is a word. `"P"` in a `char` column is a private joke the next reader will not get. `HasConversion<string>()` stores enum names such as `Paid`; retaining a legacy one-letter column needs an explicit converter that maps each code.
 
 Rename when the business corrects you. `Submit` that support calls `Place` will be searched for and not found during an incident.
 
@@ -205,7 +221,7 @@ Inside one process (a modular monolith) this is still two models:
 - `OrderingDbContext` and `BillingDbContext`
 - a PostgreSQL schema per context (`ordering`, `billing`), or two databases when a team boundary is real
 
-A shared `AppDbContext` with `DbSet<Order>` and `DbSet<Invoice>` and a navigation `Order.Invoice` couples the migrations. Billing cannot ship a column change without ordering's model snapshot. That is one context pretending to be two.
+A shared `AppDbContext` and cross-context navigations couple persistence and migrations. Separate contexts make ownership easier to enforce. A bounded context is a model and language boundary, however, not a requirement for a particular project, schema, database, or `DbContext` count. Physical separation is one implementation choice.
 
 ### Context map
 
@@ -213,16 +229,16 @@ A context map is the list of relationships between contexts. You do not need a d
 
 | Relationship | Meaning for this codebase | Ordering example |
 |--------------|---------------------------|------------------|
-| Separate ways | No calls, no shared types | A reporting warehouse reads a replica you do not code against |
-| Customer / supplier | Downstream conforms to upstream's published events | Billing consumes `ordering.order_placed.v1` and does not get a vote on the payload every week |
+| Separate ways | The contexts do not integrate | An unrelated HR module has no relationship with Ordering |
+| Customer / supplier | An upstream team plans with the needs of its downstream customer | Ordering and Billing negotiate invoice fields and their delivery schedule |
 | Open host / published language | You publish a stable contract for many consumers | The integration event, versioned, documented |
 | Anti-corruption layer | You translate their model into yours at the edge | A payment vendor's `"CAPTURED"` becomes `Order.MarkPaid` |
 | Shared kernel | A tiny shared library both teams change together | A `CustomerId` struct, if and only if both sides agree to version it |
-| Partnership | Two teams ship one change as one release | Rare. Treat it as a temporary shared kernel |
-| Conformist | You accept their model as yours | Their DTO becomes your entity. This is how payment fields leak into `Order` |
+| Partnership | Teams coordinate success, integration, and delivery | Ordering and Billing jointly plan a checkout change; this need not involve shared code |
+| Conformist | Downstream deliberately adopts an upstream model where translation is not worth its cost | A generic supporting capability uses the supplier's vocabulary; this does not require using DTOs as entities |
 | Big ball of mud | One project, every feature references every other | The thing the rest of this guide is here to avoid |
 
-The map is a decision about **source references and message contracts**. If ordering's csproj references `PaymentProvider.Sdk`, the vendor's types will show up in `Order` within a quarter.
+The map records model relationships, upstream/downstream influence, team cooperation, and integration choices. Source references and message contracts implement those choices. Open Host Service and Published Language are distinct patterns that often work together. See Eric Evans' [DDD reference](https://www.domainlanguage.com/wp-content/uploads/2016/05/DDD_Reference_2015-03.pdf).
 
 ### Shared kernel, published language, anti-corruption
 
@@ -267,7 +283,7 @@ The domain project contains the rules and the words. It has no `Save`, no `HttpC
 
 ### Value objects
 
-A value object has no identity. Two `Money` values with the same amount and currency are interchangeable. Validate in the constructor so an illegal value cannot be represented. Equality is by the components (a `readonly record struct` gives you that).
+A value object has no identity. Two `Money` values with the same amount and currency are interchangeable. Validate construction and validate again when accepting a value into an aggregate. A struct always has `default(T)`, which bypasses its constructor. Equality is by the components (a `readonly record struct` gives you that).
 
 ```C#
 public readonly record struct Money
@@ -280,15 +296,24 @@ public readonly record struct Money
         if (amount < 0)
             throw new ArgumentOutOfRangeException(nameof(amount), "Amount cannot be negative.");
         ArgumentException.ThrowIfNullOrWhiteSpace(currency);
-        if (currency.Length != 3)
-            throw new ArgumentException("Currency is a 3-letter code.", nameof(currency));
+        var normalized = currency.Trim().ToUpperInvariant();
+        if (normalized is not ("USD" or "EUR"))
+            throw new ArgumentException("This checkout supports USD and EUR.", nameof(currency));
 
         Amount = decimal.Round(amount, 2, MidpointRounding.ToEven);
-        Currency = currency.ToUpperInvariant();
+        Currency = normalized;
+    }
+
+    public void EnsureValid()
+    {
+        if (Amount < 0 || Currency is not ("USD" or "EUR"))
+            throw new DomainRuleException("Money is not a valid checkout amount.");
     }
 
     public Money Add(Money other)
     {
+        EnsureValid();
+        other.EnsureValid();
         if (!string.Equals(Currency, other.Currency, StringComparison.Ordinal))
             throw new DomainRuleException($"Cannot add {Currency} to {other.Currency}.");
         return new Money(Amount + other.Amount, Currency);
@@ -296,6 +321,7 @@ public readonly record struct Money
 
     public Money Times(int quantity)
     {
+        EnsureValid();
         if (quantity < 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
         return new Money(Amount * quantity, Currency);
@@ -303,9 +329,11 @@ public readonly record struct Money
 }
 ```
 
-Rounding lives at the boundary where money is created, so two paths do not store `10.005` and `10.01` for the same price. `ToEven` is banker's rounding. If finance wants half-up, that decision is this constructor, not `Math.Round` scattered in handlers.
+This example supports only two-decimal USD/EUR amounts. Other currencies, tax allocation, exchange rates, and negative credit amounts need explicit rules; three letters alone do not identify a supported currency. Rounding lives at the agreed business boundary where money is created, so two paths do not store `10.005` and `10.01` for the same price. `ToEven` is banker's rounding. If finance wants half-up, that decision is this constructor, not `Math.Round` scattered in handlers.
 
 `Amount + other.Amount` can be one cent off from a per-line round if you sum unrounded values. `Times` rounds again inside `new Money(...)`. Call `Times` per line, then `Add` the line totals. Do not sum raw `decimal`s and round once at the end unless finance asked for that and you have a test that pins it.
+
+This sample rounds the unit price before multiplying by integer quantity. Some businesses keep more unit-price precision and round only each line/tax allocation; model that policy explicitly rather than assuming this constructor is correct for every currency or invoice.
 
 #### Address is copied onto the order
 
@@ -325,18 +353,28 @@ public readonly record struct Address
         ArgumentException.ThrowIfNullOrWhiteSpace(city);
         ArgumentException.ThrowIfNullOrWhiteSpace(postalCode);
         ArgumentException.ThrowIfNullOrWhiteSpace(country);
-        if (country.Trim().Length != 2)
+        if (country.Trim().Length != 2 || !country.Trim().All(char.IsAsciiLetter))
             throw new ArgumentException("Country is a 2-letter code.", nameof(country));
+
+        if (line1.Trim().Length > 200 || city.Trim().Length > 100 || postalCode.Trim().Length > 20)
+            throw new ArgumentException("Shipping address exceeds the supported field lengths.");
 
         Line1 = line1.Trim();
         City = city.Trim();
         PostalCode = postalCode.Trim();
         Country = country.Trim().ToUpperInvariant();
     }
+
+    public void EnsureValid()
+    {
+        if (string.IsNullOrWhiteSpace(Line1) || string.IsNullOrWhiteSpace(City)
+            || string.IsNullOrWhiteSpace(PostalCode) || Country is null || Country.Length != 2)
+            throw new DomainRuleException("Shipping address is incomplete.");
+    }
 }
 ```
 
-`Order` stores an `Address` value captured at `Place`. Later edits to the customer profile do not write through to old orders.
+This address example checks shape and field lengths, not whether a postal code or country is recognized/deliverable; those rules need the context's supported-country/address policy. `Order` stores an `Address` value captured at `Place`. Later edits to the customer profile do not write through to old orders.
 
 #### ❌ BAD — a value with identity, or an entity with no behavior
 
@@ -353,15 +391,15 @@ An `Id` on money means two 10 USD amounts are different objects. You will write 
 
 #### Record struct, record class, and collections
 
-Prefer `readonly record struct` for small values (`Money`, `Address`, `OrderId`): value equality, no heap allocation per id. Prefer a `sealed class` when EF owns a collection of them (`OrderLine`), because owned-entity collections are reference types with a private constructor EF can hit.
+Use `readonly record struct` for small values (`Money`, `OrderId`) when copying cost is small. An `Address` struct works here, but a larger immutable reference value can be preferable. Structs avoid a separate allocation when not boxed; they still have default values and are not automatically faster. Prefer a `sealed class` when EF owns a collection of them (`OrderLine`), because owned-entity collections are reference types with a private constructor EF can hit.
 
 Do not put a mutable `List<T>` inside a value object and still call it a value. Equality will not look at the list the way you think if you hand-roll it, and callers can mutate the list after you "copy" the value. Expose `IReadOnlyList<T>` from the aggregate instead, and keep the `List<T>` private there.
 
-`record class` for `Money` also works and is easier to spot in a debugger as a reference. It allocates. For money created in a loop over lines, the struct is the calmer default. Be consistent inside one context so EF configuration does not mix converter styles at random.
+An immutable `record class` for `Money` also works; be careful that public `init` properties and `with` copies can bypass constructor-only validation. It allocates. For money created in a loop over lines, the struct is the calmer default. Be consistent inside one context so EF configuration does not mix converter styles at random.
 
 ### Entities and identity
 
-An entity is defined by its id. Two orders with the same lines and different ids are different orders. `OrderId` and `CustomerId` are different types so `GetAsync(customerId)` does not compile.
+An entity is defined by its id. Two orders with the same lines and different ids are different orders. Identity is scoped to the entity type/context (and tenant where applicable); C# class equality remains reference equality unless you implement identity-based equality. Do not use record value equality over all mutable entity fields as a substitute. `OrderId` and `CustomerId` are different types so `GetAsync(customerId)` does not compile.
 
 ```C#
 public readonly record struct OrderId(Guid Value)
@@ -370,7 +408,7 @@ public readonly record struct OrderId(Guid Value)
 
     public static bool TryParse(string? text, IFormatProvider? provider, out OrderId id)
     {
-        if (Guid.TryParse(text, out var value))
+        if (Guid.TryParse(text, out var value) && value != Guid.Empty)
         {
             id = new OrderId(value);
             return true;
@@ -392,13 +430,13 @@ public sealed class DomainRuleException(string message) : Exception(message);
 
 `TryParse(string?, IFormatProvider?, out OrderId)` is the overload minimal APIs bind for route and query values. A JSON body still needs a `JsonConverter<OrderId>` (shown with the API). `Guid.CreateVersion7()` is .NET 9+. On .NET 8 use `Guid.NewGuid()`.
 
-Generate the id in the domain factory, before the insert. The handler then knows `order.Id` and can write the idempotency row in the same commit. A database `IDENTITY` / `gen_random_uuid()` default hides the id until `SaveChanges` returns, which splits "I reserved this id" from "I inserted". Database-generated integer keys are fine for a CRUD table. They are awkward for an aggregate that emits `OrderPlaced(order.Id)` before commit: you want that id stable even if the commit fails and you must not reuse a half-published id. A UUIDv7 generated in the factory is stable and sorts by time. See [Database_Indexing.md](Database_Indexing.md) for why random UUIDv4 as a clustered key splits pages.
+Generate the id before the insert (this sample does so in the application handler). The handler then knows `order.Id` and can write the idempotency row in the same commit. A database `IDENTITY` / `gen_random_uuid()` default hides the id until `SaveChanges` returns, which splits "I reserved this id" from "I inserted". Database-generated integer keys are fine for a CRUD table. They are awkward for an aggregate that emits `OrderPlaced(order.Id)` before commit: you want that id stable even if the commit fails and you must not reuse a half-published id. A client-generated UUIDv7 is stable for that attempt and contains a time component; ordering and index locality depend on the database's UUID comparison. It is not a strict event sequence or a replacement for idempotency. See [Database_Indexing.md](Database_Indexing.md).
 
 #### Child identity inside the aggregate
 
 `OrderLine` is not an aggregate. It has no repository. It is saved only with its `Order`. It still needs a way to say "this line" when the user changes a quantity.
 
-If the business rule is "one line per product", `ProductId` is the identity inside the order. `ChangeQuantity(ProductId, int)` finds the line. A separate `LineId` is extra surface.
+If the business rule is "one line per product", `ProductId` is the identity inside the order. `ProductId` identifies the line for queries or a future amendment use case. A separate `LineId` is extra surface.
 
 If the business rule is "the same product can appear twice" (two shipments, two prices), `ProductId` is not unique inside the order and a `LineId` is the identity. Pick the rule the business actually has. The sample uses one line per product.
 
@@ -413,7 +451,13 @@ public sealed class OrderLine
             throw new DomainRuleException("Quantity must be positive.");
         ArgumentException.ThrowIfNullOrWhiteSpace(productName);
 
+        if (productId.Value == Guid.Empty)
+            throw new DomainRuleException("Product id is required.");
+        unitPrice.EnsureValid();
+
         ProductId = productId;
+        if (productName.Trim().Length > 200)
+            throw new DomainRuleException("Product name is too long.");
         ProductName = productName.Trim();
         Quantity = quantity;
         UnitPrice = unitPrice;
@@ -426,16 +470,10 @@ public sealed class OrderLine
 
     public Money LineTotal => UnitPrice.Times(Quantity);
 
-    internal void ChangeQuantity(int quantity)
-    {
-        if (quantity <= 0)
-            throw new DomainRuleException("Quantity must be positive.");
-        Quantity = quantity;
-    }
 }
 ```
 
-`ProductName` and `UnitPrice` are a snapshot. They are copied from the catalog at the moment of `Place`. The line does not hold a `Product` navigation. `internal ChangeQuantity` means only `Order` (same assembly) changes a line. A handler cannot do `line.Quantity = 0`.
+`ProductName` and `UnitPrice` are a snapshot. They are copied from the catalog at the moment of `Place`. The line does not hold a `Product` navigation. The line has no public mutation API. `internal` would allow every type in the assembly to call a method, not just `Order`; access modifiers alone do not enforce aggregate ownership.
 
 The private parameterless constructor is for EF Core materialization. Application code uses the public constructor.
 
@@ -447,8 +485,8 @@ Rules of thumb that hold up in this kind of system:
 
 1. A transaction changes **one aggregate**, or a small set you have explicitly accepted (the sample's place-and-reserve is that exception, and it is discussed below).
 2. Reach another aggregate by id (`CustomerId`, `ProductId`), not by a navigation you lazy-load.
-3. Keep the cluster small enough that two clerks are not serializing on the same row for unrelated edits. An `Order` that also contains the customer's profile, the product catalog, and the year's invoices will deadlock.
-4. Invariants that span roots ("this customer's lifetime spend") are eventually consistent or they are a different aggregate. They are not a join in `Order.Place`.
+3. Keep the cluster small enough that two clerks are not serializing on the same row for unrelated edits. An `Order` that also contains the customer's profile, the product catalog, and the year's invoices creates unnecessary contention and larger transactions.
+4. For a rule spanning roots, decide whether a projection may be eventually consistent, a different aggregate boundary is needed, or a local transaction/constraint must enforce it. An in-memory check or a join alone cannot close a concurrent race.
 
 ```C#
 public enum OrderStatus
@@ -472,9 +510,10 @@ public sealed class Order : IHasDomainEvents
     public OrderStatus Status { get; private set; }
     public Address ShipTo { get; private set; }
     public string? IdempotencyKey { get; private set; }
+    public string RequestHash { get; private set; } = "";
     public DateTimeOffset PlacedAt { get; private set; }
-    public IReadOnlyList<OrderLine> Lines => _lines;
-    public IReadOnlyCollection<IDomainEvent> DomainEvents => _events;
+    public IReadOnlyList<OrderLine> Lines => _lines.AsReadOnly();
+    public IReadOnlyCollection<IDomainEvent> DomainEvents => _events.AsReadOnly();
 
     public Money Total => _lines
         .Select(line => line.LineTotal)
@@ -490,11 +529,15 @@ public sealed class Order : IHasDomainEvents
         Address shipTo,
         IReadOnlyList<OrderLine> lines,
         string? idempotencyKey,
+        string requestHash,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(lines);
         if (lines.Count == 0)
             throw new DomainRuleException("An order needs at least one line.");
+        if (id.Value == Guid.Empty || customerId.Value == Guid.Empty)
+            throw new DomainRuleException("Order and customer ids are required.");
+        shipTo.EnsureValid();
 
         var order = new Order
         {
@@ -503,6 +546,7 @@ public sealed class Order : IHasDomainEvents
             ShipTo = shipTo,
             Status = OrderStatus.Placed,
             IdempotencyKey = idempotencyKey,
+            RequestHash = requestHash,
             PlacedAt = now
         };
 
@@ -513,24 +557,16 @@ public sealed class Order : IHasDomainEvents
         return order;
     }
 
-    public void AddLine(OrderLine line)
+    private void AddLine(OrderLine line)
     {
-        EnsureStatus(OrderStatus.Placed, "Lines can change only on a placed order.");
+        ArgumentNullException.ThrowIfNull(line);
         if (_lines.Any(existing => existing.ProductId == line.ProductId))
             throw new DomainRuleException("A product appears on at most one line.");
         if (_lines.Count > 0 && _lines[0].UnitPrice.Currency != line.UnitPrice.Currency)
             throw new DomainRuleException("An order uses one currency.");
 
-        _lines.Add(line);
-    }
-
-    public void ChangeQuantity(ProductId productId, int quantity, DateTimeOffset now)
-    {
-        EnsureStatus(OrderStatus.Placed, "Quantity can change only on a placed order.");
-        var line = _lines.SingleOrDefault(l => l.ProductId == productId)
-            ?? throw new DomainRuleException("That product is not on the order.");
-        line.ChangeQuantity(quantity);
-        Raise(new OrderQuantityChanged(Guid.CreateVersion7(), Id, productId, quantity, now));
+        // Own a copy: one child instance must not be attached to two orders.
+        _lines.Add(new OrderLine(line.ProductId, line.ProductName, line.Quantity, line.UnitPrice));
     }
 
     public void MarkPaid(DateTimeOffset now)
@@ -575,7 +611,7 @@ public sealed class Order : IHasDomainEvents
 }
 ```
 
-`Place` calls `AddLine`, so the "one product, one currency" rules exist once. A later `AddLine` from a handler on a paid order fails `EnsureStatus`. There is no public `List` to `Add` into.
+`Place` calls private `AddLine`, so the "one product, one currency" rules exist once. Placed lines are fixed in this checkout: stock and the requested payment amount already correspond to them. A future amendment must adjust the reservation and financial snapshot atomically, with a new business transition/event. Do not expose `ChangeQuantity` without that use case. The read-only wrapper also prevents a caller from casting `Lines` back to the backing `List` and bypassing the rules.
 
 `Total` folds line totals that are already rounded. The seed `new Money(0, Currency)` uses the first line's currency, so an empty order throws a domain exception instead of inventing `"USD"`.
 
@@ -637,11 +673,11 @@ ALTER TABLE ordering.orders
   CHECK (status IN ('Placed', 'Paid', 'Shipped', 'Cancelled', 'PaymentFailed'));
 ```
 
-The check constraint is the backstop when someone runs SQL in a console. The enum is the backstop when someone writes C#. `ChangeQuantity` takes `DateTimeOffset now` the same way `Cancel` does. The aggregate does not call `TimeProvider` or `DateTime.UtcNow`. The handler reads the clock once per use case and passes that value in. Tests pass a fixed `DateTimeOffset`.
+The check constraint protects the stored status value when SQL bypasses the model. It does not enforce transition history, and a C# enum can still contain an undefined cast integer; the aggregate methods are the transition guard. `Cancel`, `Ship`, and payment transitions take `DateTimeOffset now`. The aggregate does not call `TimeProvider` or `DateTime.UtcNow`. The handler reads the clock once per use case and passes that value in. Tests pass a fixed `DateTimeOffset`.
 
 ### Reference by identity, one transaction
 
-`Order` holds `CustomerId`. It does not hold `Customer`. Loading a customer graph to place an order locks and copies data the order does not invariant-check. The handler checks "customer exists" through a port if it must, then passes the id in.
+`Order` holds `CustomerId`. It does not hold `Customer`. Loading a customer graph to place an order fetches data the order does not invariant-check; a normal read does not imply a write lock. The handler checks "customer exists" through a port if it must, then passes the id in.
 
 ```C#
 public interface ICustomerDirectory
@@ -652,7 +688,7 @@ public interface ICustomerDirectory
 
 That port is application-level. The directory's implementation reads the customer context (HTTP, or a replica, or a table this context is allowed to read). A missing customer is `NotFoundException` or a domain exception you chose for "we do not sell to unknown ids". It is not `order.Customer.Name`.
 
-**One transaction, one root** is the default because the aggregate is the lock boundary. Two clerks paying two orders do not block each other.
+**One transaction, one root** is a useful default because the aggregate is the consistency boundary; the database isolation/locking strategy still decides which locks are taken. Two clerks paying two orders do not block each other.
 
 **Place and reserve** in this sample touch `Order` and `Stock` in one commit on purpose. They sit in the same bounded context, the same database, and the business rule is "we do not create an order we could not reserve". A saga would leave a `Placed` order with no reserve and a worker to repair it. That machinery is justified when stock or payment lives in another service. See [Saga with MassTransit](#saga-with-masstransit). It is ceremony when both rows are in schema `ordering`.
 
@@ -669,7 +705,7 @@ public sealed class Stock : IHasDomainEvents
     public int OnHand { get; private set; }
     public int Reserved { get; private set; }
     public int Available => OnHand - Reserved;
-    public IReadOnlyCollection<IDomainEvent> DomainEvents => _events;
+    public IReadOnlyCollection<IDomainEvent> DomainEvents => _events.AsReadOnly();
 
     public static Stock Receive(ProductId productId, int onHand)
     {
@@ -706,9 +742,9 @@ public sealed class Stock : IHasDomainEvents
 
 `Stock` does not store every reservation as a child list in this slice. `Reserved` is a counter. That loses "which order reserved" inside the aggregate. `StockReserved` carries `OrderId` for the outbox, and the order lines are the record of what this order asked for. If you must cancel a single reserve without trusting the order lines, store a `Reservation(OrderId, Quantity)` collection inside `Stock` and make `Release` find it. That collection grows with every open order for the SKU. For a busy SKU, a counter plus the order as the source of "how many" is the smaller aggregate. Write the choice down next to `Reserve` so the next person does not add a collection of every historical reservation "for audit" and turn the hot row into a megabyte.
 
-`Stock` implements `IHasDomainEvents` so the same interceptor that copies `Order` events can copy `StockReserved` once you give it a mapper. `ClearEvents` is for that interceptor after a successful save. Handlers do not call it.
+`Stock` implements `IHasDomainEvents` so the same interceptor that copies `Order` events can copy `StockReserved` once you give it a mapper. `ClearEvents` is for infrastructure after a successful transaction. Handlers do not call it.
 
-Negative `Available` is the invariant. A raw `UPDATE stock SET reserved = reserved + @q` in a controller will go negative under two concurrent checkouts that both read `Available == 1`. The concurrency token later in this guide closes the lost update. `Reserve` closes the illegal state in memory. You need both: the method so a single caller cannot reserve a negative, the token so two callers cannot both pass the check on a stale `Available`.
+The invariant is `0 <= Reserved <= OnHand`, so `Available` stays nonnegative. A raw increment without a conditional stock predicate can violate it under concurrent checkouts. The concurrency token later in this guide closes the lost update. `Reserve` closes the illegal state in memory. You need both: the method so a single caller cannot reserve a negative, the token so two callers cannot both pass the check on a stale `Available`.
 
 ### Loading must not replay factories
 
@@ -726,7 +762,7 @@ private Order() { } // EF. Does not validate. Does not raise.
 public static Order Place(...) { /* validates, raises once */ }
 ```
 
-If you delete the private constructor and leave only `Place`'s object initializer path, EF still needs a constructor it can call. A single public constructor with parameters can be used by EF Core as a binding constructor. Arguments passed by EF bypass your `if` checks only if you put the checks after assignment in a way EF's constructor binding skips. Keep checks in the constructor body, and keep a private empty constructor so EF's path and the factory path stay obvious. Then configure the factory as the only method application code calls. Analyzers will not save you from `new Order()` if the empty constructor is public. Keep it private.
+If you delete the private constructor and leave only `Place`'s object initializer path, EF still needs a constructor it can call. EF Core can bind a parameterized constructor to mapped scalar properties; if it chooses that constructor, its body runs, including its checks. EF does not bypass statements inside a constructor. Keep a private empty constructor to make this sample's materialization path explicit. Then configure the factory as the only method application code calls. Analyzers will not save you from `new Order()` if the empty constructor is public. Keep it private.
 
 ### Concurrency
 
@@ -738,7 +774,7 @@ Optimistic concurrency is the default for orders (conflicts are rare). A hot `St
 
 ### Domain services and policies
 
-A domain service is stateless business logic that does not naturally sit on one entity, and that does no I/O. If it needs `DbContext` or `HttpClient`, it is an application or infrastructure service with a confusing name.
+A domain service expresses business behavior that does not naturally belong to an entity or value object. This guide keeps its policies pure and supplies any needed facts from the application layer. DDD does not categorically ban a domain service from depending on a domain abstraction for a lookup; concrete `DbContext`, HTTP, and vendor SDK dependencies still belong outside the domain.
 
 Prefer a method on `Order` when only that aggregate's data is involved. `Total` is a method (a property here) because it reads lines. A **policy** is a domain service you expect to replace: staff discount, no discount, a voucher.
 
@@ -790,13 +826,6 @@ public sealed record OrderPaid(Guid EventId, OrderId OrderId, DateTimeOffset Occ
 public sealed record OrderPaymentFailed(Guid EventId, OrderId OrderId, DateTimeOffset OccurredAt) : IDomainEvent;
 public sealed record OrderShipped(Guid EventId, OrderId OrderId, DateTimeOffset OccurredAt) : IDomainEvent;
 public sealed record OrderCancelled(Guid EventId, OrderId OrderId, DateTimeOffset OccurredAt) : IDomainEvent;
-public sealed record OrderQuantityChanged(
-    Guid EventId,
-    OrderId OrderId,
-    ProductId ProductId,
-    int Quantity,
-    DateTimeOffset OccurredAt) : IDomainEvent;
-
 public sealed record StockReserved(
     Guid EventId,
     ProductId ProductId,
@@ -821,7 +850,7 @@ public sealed record StockCommitted(
 
 `EventId` is generated when the fact happens, not when the outbox worker publishes. A retry of the worker resends the same id. Consumers dedupe on it.
 
-`ClearEvents` is for infrastructure after the events have been copied onto the outbox. Application handlers should not call it. If that bothers you, make the method `internal` and add `InternalsVisibleTo` for the infrastructure assembly. Do not make the event list a public `List<T>`.
+`ClearEvents` is for infrastructure after the transaction containing those events commits. Application handlers should not call it. A public interface member cannot be implemented by merely making the aggregate method `internal`: use explicit interface implementation to hide it from the ordinary aggregate API, or move the event-storage contract behind an internal boundary with intentional friend-assembly access. Do not make the event list a public `List<T>`.
 
 The aggregate does not dispatch. Dispatch needs handlers, and handlers need I/O, and I/O in `Cancel` sends mail for a transaction that later rolls back.
 
@@ -888,35 +917,22 @@ Keep a coarse edge check when you want a validation list ("line 2 quantity, line
 
 ### Uniqueness is a constraint, not a method
 
-"An email is unique" and "an idempotency key is used once" cannot be enforced by an entity. The entity does not see the other rows. Two concurrent requests can both pass `AnyAsync(e => e.Email == email)` and both insert.
+An entity cannot enforce uniqueness across all persisted entities. Two requests may both pass an existence check before either inserts. Use a database unique constraint/index as the authority, with an optional application pre-check for a friendly response.
 
-The authority is a unique index. The handler's pre-check exists to return a clean 409 instead of a database exception. On the race, catch the unique violation and translate it.
-
-```C#
-builder.HasIndex(o => o.IdempotencyKey).IsUnique();
-```
+For this checkout, idempotency belongs to a customer and this operation:
 
 ```C#
-try
-{
-    await unitOfWork.CommitAsync(cancellationToken);
-}
-catch (DbUpdateException ex) when (IsUniqueViolation(ex))
-{
-    var winner = await idempotency.FindAsync(command.Key, cancellationToken);
-    if (winner is not null)
-        return winner.OrderId;
-    throw;
-}
+builder.HasIndex(o => new { o.CustomerId, o.IdempotencyKey })
+    .HasDatabaseName("ux_orders_customer_idempotency")
+    .IsUnique()
+    .HasFilter("idempotency_key IS NOT NULL");
 ```
 
-`IsUniqueViolation` for PostgreSQL checks SQLSTATE `23505`. For SQL Server it checks error number `2601` or `2627`. That function lives in infrastructure, beside the `DbContext`. The application port can expose `Task<OrderId?> FindExistingAsync(...)` and the repository catches the provider exception, so the handler stays free of `PostgresException`. Either place is fine. The handler referencing `PostgresException` is not.
+Infrastructure must inspect the **constraint name as well as the provider's error code**. PostgreSQL SQLSTATE `23505` and SQL Server errors `2601`/`2627` mean a unique violation, but might refer to an unrelated constraint. Translate only the expected idempotency constraint into `UniqueConstraintViolationException`. Do not treat every unique violation as a successful replay. After a failed write, end that unit of work; the next request can look up the committed winner in a fresh context. See [Idempotency](#idempotency).
 
-Do not try to make this a domain service that takes `IOrderRepository`. You would be teaching the domain about query races it cannot close.
+### Authorization and business permissions
 
-### Authorization is not a domain rule
-
-`Order.Cancel` answers "is this order in a state that can be cancelled?". It does not answer "is this user allowed to cancel it?". Roles change without the business invariant changing. Staff can cancel a customer's placed order. The customer can cancel their own. A warehouse user cannot.
+`Order.Cancel` answers "is this order in a state that can be cancelled?". It does not answer "is this user allowed to cancel it?". Technical roles and authentication are application concerns. A business permission such as "a payment needs approval by someone other than its author" is a domain rule; model it with business identities and policy inputs rather than framework claims. Staff can cancel a customer's placed order. The customer can cancel their own. A warehouse user cannot.
 
 ```C#
 public sealed class CancelOrderHandler(
@@ -997,7 +1013,7 @@ app.Run();
 
 ### Enforce the rule with a test
 
-A comment in the csproj rots. A test fails in CI the day someone adds `PackageReference Include="Microsoft.EntityFrameworkCore"` to the domain project to "just map one attribute".
+A comment in the csproj does not enforce a boundary. A reference test detects forbidden assemblies used by domain code; a project-file/dependency check detects the forbidden package reference itself.
 
 ```C#
 public sealed class DependencyRuleTests
@@ -1029,7 +1045,7 @@ public sealed class DependencyRuleTests
 }
 ```
 
-`NetArchTest` and similar packages can also ban a namespace. The reflection test above has no extra dependency and catches the mistake that matters: a package reference. It does not catch `Infrastructure` types used through a transitive reference you did not intend. Keep the csproj references tight and this test is enough.
+`NetArchTest` and similar packages can also ban a namespace. The reflection test above checks assembly references emitted for used types. An unused `PackageReference` or `ProjectReference` may not appear in that list, and reflection is not a complete dependency audit. Inspect project files (including central package/build files) in CI to enforce forbidden direct references, and use type-level architecture tests for actual dependencies.
 
 Run it in the domain test project and the application test project. A test project may reference both sides; production projects may not.
 
@@ -1089,7 +1105,7 @@ src/
   Ordering.Application.Tests/
 ```
 
-This tree is **one module, split into projects** so the compiler rejects an EF reference from the domain. [Modular monolith](#modular-monolith) is the other shape: one assembly per bounded context, plus a Contracts assembly, when Ordering and Billing share a process. Do not do both at once (four projects times every module). Start with the tree above for the first context. Switch a module to one assembly when a second context appears and the project count is the problem.
+This tree is **one module, split into projects** so the compiler rejects an EF reference from the domain. [Modular monolith](#modular-monolith) is the other shape: one assembly per bounded context, plus a Contracts assembly, when Ordering and Billing share a process. Choose one assembly or several projects per module based on the enforcement and maintenance you need. Four projects per module can be reasonable; a second bounded context does not itself require collapsing the layers.
 
 ### Feature folders inside a layer
 
@@ -1130,7 +1146,7 @@ The domain project groups by aggregate (`Orders/`, `Stock/`), because the consis
 <!-- Ordering.Domain.csproj -->
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
@@ -1141,6 +1157,8 @@ The domain project groups by aggregate (`Orders/`, `Stock/`), because the consis
 <!-- Ordering.Application.csproj -->
 <ItemGroup>
   <ProjectReference Include="..\Ordering.Domain\Ordering.Domain.csproj" />
+  <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+  <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
 </ItemGroup>
 ```
 
@@ -1148,22 +1166,31 @@ The domain project groups by aggregate (`Orders/`, `Stock/`), because the consis
 <!-- Ordering.Infrastructure.csproj -->
 <ItemGroup>
   <ProjectReference Include="..\Ordering.Application\Ordering.Application.csproj" />
-  <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
-  <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.0" />
+  <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.10" />
+  <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+  <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0" />
+  <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.0" />
+  <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.0" />
 </ItemGroup>
 ```
 
 ```xml
 <!-- Ordering.Api.csproj -->
 <Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Ordering.Application\Ordering.Application.csproj" />
     <ProjectReference Include="..\Ordering.Infrastructure\Ordering.Infrastructure.csproj" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10" PrivateAssets="all" />
   </ItemGroup>
 </Project>
 ```
 
-The domain csproj has no `FrameworkReference` for ASP.NET and no EF package. `ImplicitUsings` for `Microsoft.NET.Sdk` does not pull in ASP.NET. The web SDK on the API project does. That split is the point of a separate domain project.
+The Application and Infrastructure snippets show only their `ItemGroup`; wrap each in an SDK project with the same target framework, nullable, and implicit-usings settings as Domain (or use shared `Directory.Build.props`). DI/logging abstractions supply framework-neutral application registration/decorators; HTTP/configuration/hosting packages support the infrastructure adapters. The API's design package supports the migration startup host. Add the compatible MassTransit packages only for the optional saga. Package versions shown are example pins, not a claim that they are the latest; keep the EF provider major compatible and apply supported patches. The domain csproj has no `FrameworkReference` for ASP.NET and no EF package. `ImplicitUsings` for `Microsoft.NET.Sdk` does not pull in ASP.NET. The web SDK on the API project does. That split is the point of a separate domain project.
 
 ## Hexagonal architecture
 
@@ -1251,14 +1278,14 @@ public sealed class CancelOrderConsumer(CancelOrderHandler handler)
         handler.HandleAsync(
             new CancelOrder(
                 new OrderId(message.OrderId),
-                new Actor(new UserId(message.RequestedBy), ActorRole.System, customerId: null)),
+                new Actor(new UserId(message.RequestedBy), ActorRole.Staff, CustomerId: null)),
             cancellationToken);
 }
 
 public sealed record CancelOrderV1(Guid OrderId, Guid RequestedBy);
 ```
 
-The consumer lives next to the host that reads the queue, not in `Ordering.Domain`. It may live in `Ordering.Api` or in a worker project. It references the application project so it can construct `CancelOrder`. It does not reference `OrderingDbContext`.
+This privileged cancel adapter may create a staff actor only from a trusted, authorized internal producer. Do not trust `RequestedBy` or a role supplied in an arbitrary message; otherwise it becomes an authorization bypass. `System` is reserved for payment processing here and is rejected by `CancelOrderHandler`. The consumer lives next to the host that reads the queue, not in `Ordering.Domain`. It may live in `Ordering.Api` or in a worker project. It references the application project so it can construct `CancelOrder`. It does not reference `OrderingDbContext`.
 
 Adding `ICancelOrderHandler` as a mirror of the one class does not create a port you did not already have. The public method is the port. Introduce the interface when a second *implementation* of the use case exists, which is rare (a decorator around the handler is that case; see [a pipeline without a mediator](#a-pipeline-without-a-mediator)).
 
@@ -1362,18 +1389,24 @@ public interface IPaymentGateway
     Task AuthorizeAsync(OrderId orderId, Money amount, CancellationToken cancellationToken);
 }
 
-public sealed class StripePaymentGateway(HttpClient http) : IPaymentGateway
+public sealed class ExamplePaymentGateway(HttpClient http) : IPaymentGateway
 {
     public async Task AuthorizeAsync(OrderId orderId, Money amount, CancellationToken cancellationToken)
     {
         var body = new
         {
-            amount = ToMinorUnits(amount),
+            amount = PaymentAmounts.ToMinorUnits(amount),
             currency = amount.Currency.ToLowerInvariant(),
             metadata = new { orderId = orderId.Value }
         };
 
-        using var response = await http.PostAsJsonAsync("v1/payment_intents", body, cancellationToken);
+        // Fictional JSON API: real vendor protocols belong in their own adapter.
+        using var request = new HttpRequestMessage(HttpMethod.Post, "authorizations")
+        {
+            Content = JsonContent.Create(body)
+        };
+        request.Headers.Add("Idempotency-Key", $"authorize:{orderId.Value}");
+        using var response = await http.SendAsync(request, cancellationToken);
         response.EnsureSuccessStatusCode();
     }
 }
@@ -1488,12 +1521,16 @@ public interface IUnitOfWork
 
 public interface IIdempotencyStore
 {
-    Task<OrderId?> FindAsync(string key, CancellationToken cancellationToken);
+    Task<IdempotencyRecord?> FindAsync(CustomerId customerId, string key, CancellationToken cancellationToken);
 }
+
+public sealed record IdempotencyRecord(OrderId OrderId, string RequestHash);
+public sealed class UniqueConstraintViolationException : Exception;
 
 public sealed class NotFoundException(string message) : Exception(message);
 public sealed class ForbiddenException : Exception;
 public sealed class ConflictException(string message) : Exception(message);
+public sealed class PaymentNoLongerAcceptedException(string message) : Exception(message);
 ```
 
 There is no `Update` on `IOrderRepository`. The scoped `DbContext` tracks the instance `GetAsync` returned. `Cancel` mutates it. `CommitAsync` calls `SaveChangesAsync`. An `Update` method that calls `db.Update(order)` marks the whole graph `Modified`, including unchanged lines, and fights the concurrency token.
@@ -1506,7 +1543,7 @@ Where the interface sits: this guide puts ports in the application project, beca
 
 ### Edge validation
 
-Validate shape before you touch the database: missing key, empty line list, quantity that is not a number. The framework already does some of this when the JSON does not match `LineRequest`. What is left is rules about the command that are not invariants of a single `Order` (an empty batch, a key longer than the column).
+Validate command shape for every driving adapter, before I/O. HTTP binding rejects malformed JSON; it does not automatically make nullable runtime data, empty GUIDs, or collections valid just because the C# annotations are non-nullable.
 
 ```C#
 public static class PlaceOrderRules
@@ -1515,22 +1552,40 @@ public static class PlaceOrderRules
 
     public static void EnsureShape(PlaceOrder command)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(command.IdempotencyKey);
-        if (command.IdempotencyKey.Length > 80)
-            throw new DomainRuleException("Idempotency key is too long.");
-        if (command.Lines.Count is 0 or > MaxLines)
+        if (string.IsNullOrWhiteSpace(command.IdempotencyKey) || command.IdempotencyKey.Length > 80)
+            throw new DomainRuleException("An idempotency key of 1 to 80 characters is required.");
+        if (command.CustomerId.Value == Guid.Empty)
+            throw new DomainRuleException("Customer id is required.");
+        if (command.Lines is null || command.Lines.Count is 0 or > MaxLines)
             throw new DomainRuleException($"An order has 1 to {MaxLines} lines.");
+        if (command.Lines.Any(line => line is null || line.ProductId.Value == Guid.Empty || line.Quantity <= 0))
+            throw new DomainRuleException("Every line needs a product and positive quantity.");
+        command.ShipTo.EnsureValid();
+    }
+
+    public static string Fingerprint(PlaceOrder command)
+    {
+        // Version the canonical form; include semantic client input, not current catalog prices.
+        var canonical = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            Version = 1,
+            CustomerId = command.CustomerId.Value,
+            command.ShipTo,
+            Lines = command.Lines.OrderBy(line => line.ProductId.Value)
+                .Select(line => new { ProductId = line.ProductId.Value, line.Quantity }).ToArray()
+        });
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(canonical));
     }
 }
 ```
 
-Throwing `DomainRuleException` for a bad key mixes "your JSON is nonsense" with "a shipped order cannot be cancelled". Both are 400s, so the sample stays small. When you want different titles in problem details, introduce `ValidationException` for shape and keep `DomainRuleException` for the aggregate. Map both to 400 with different `title` values.
+The address constructor trims strings; the fingerprint therefore represents that normalized command. Line order is irrelevant in this model. Keep this canonical form stable while old keys remain valid. Exclude `Actor` because the same authorized operation may be retried through another driver.
 
-FluentValidation and DataAnnotations are edge tools. They are not a reason to skip `if (quantity <= 0)` inside `OrderLine`. A consumer that builds a `PlaceOrder` in C# will not run your HTTP validator.
+This compact example uses `DomainRuleException` for shape errors as well as invariants, mapped to 400. A separate application `ValidationException` or validation result is useful for field-level errors. Edge validators may duplicate a coarse invariant check to collect errors, but the aggregate remains the authority.
 
 ### Idempotency
 
-The client retries `POST /orders` when the response is lost. Without a key you create two orders and reserve stock twice. The client sends `Idempotency-Key`. You store it on the order (unique index) and return the original `OrderId` on a replay.
+A lost HTTP response must not create another order or reserve stock twice. Scope the key by operation and authorized customer (and tenant when present), store a canonical request hash, and return the original id only for the same request. A different request with the same key returns 409. Checking authorization **before** lookup prevents another caller from discovering or replaying someone else's order.
 
 ```C#
 public sealed class PlaceOrderHandler(
@@ -1544,10 +1599,19 @@ public sealed class PlaceOrderHandler(
     public async Task<OrderId> HandleAsync(PlaceOrder command, CancellationToken cancellationToken)
     {
         PlaceOrderRules.EnsureShape(command);
+        if (command.Actor.Role is not (ActorRole.Buyer or ActorRole.Staff))
+            throw new ForbiddenException();
+        if (command.Actor.Role == ActorRole.Buyer && command.Actor.CustomerId != command.CustomerId)
+            throw new ForbiddenException();
 
-        var existing = await idempotency.FindAsync(command.IdempotencyKey, cancellationToken);
+        var requestHash = PlaceOrderRules.Fingerprint(command);
+        var existing = await idempotency.FindAsync(command.CustomerId, command.IdempotencyKey, cancellationToken);
         if (existing is not null)
-            return existing.Value;
+        {
+            if (existing.RequestHash != requestHash)
+                throw new ConflictException("This key was used for a different request.");
+            return existing.OrderId;
+        }
 
         var now = time.GetUtcNow();
         var lines = new List<OrderLine>(command.Lines.Count);
@@ -1558,17 +1622,12 @@ public sealed class PlaceOrderHandler(
             lines.Add(new OrderLine(offer.ProductId, offer.Name, requested.Quantity, offer.UnitPrice));
         }
 
-        var order = Order.Place(
-            OrderId.New(),
-            command.CustomerId,
-            command.ShipTo,
-            lines,
-            command.IdempotencyKey,
-            now);
-
+        var order = Order.Place(OrderId.New(), command.CustomerId, command.ShipTo,
+            lines, command.IdempotencyKey, requestHash, now);
         await orders.AddAsync(order, cancellationToken);
 
-        foreach (var line in order.Lines)
+        // Consistent lock/update order reduces deadlocks across multi-product checkouts.
+        foreach (var line in order.Lines.OrderBy(line => line.ProductId.Value))
         {
             var stock = await stockItems.GetAsync(line.ProductId, cancellationToken)
                 ?? throw new DomainRuleException($"No stock row for {line.ProductId}.");
@@ -1581,31 +1640,19 @@ public sealed class PlaceOrderHandler(
         }
         catch (UniqueConstraintViolationException)
         {
-            var winner = await idempotency.FindAsync(command.IdempotencyKey, cancellationToken);
-            if (winner is not null)
-                return winner.Value;
-            throw;
+            // Do not query or save again on the context that lost the insert race.
+            throw new ConflictException("This key was committed concurrently. Retry with the same key and body.");
         }
-
         return order.Id;
     }
 }
 ```
 
-`UniqueConstraintViolationException` is an application exception. Infrastructure catches `DbUpdateException`, checks SQLSTATE `23505` (or SQL Server 2601/2627), and throws this. The handler does not reference Npgsql.
+Two requests may both miss the lookup. The named unique index selects a winner and the loser's whole `SaveChanges` rolls back, including stock and outbox. Its scope must end. The retry performs a new lookup and compares the hash. A stock concurrency conflict may occur first instead; it also ends the attempt. Transparent replay in the racing request needs a separate clean lookup context and the same hash check.
 
-The race: two requests pass `FindAsync` before either commits. Both build an order. One insert wins the unique index. The loser catches, re-reads, and returns the winner's id. The loser's in-memory `Order` and stock reserve are on a `DbContext` that failed `SaveChanges`. Dispose the scope. Do not `Commit` again on that context: tracked `Added` entities are in a bad state. ASP.NET Core disposes the request scope when the exception leaves the handler if you rethrow; because we catch and return, the same context is still alive and still tracking the failed graph.
+Keep keys for the promised retry window; deleting a receipt or freeing a key permits the operation to run again. Replays use the original catalog-price snapshot even if today's price changed. A gateway needs its own idempotency key: an order's database key does not deduplicate a remote charge.
 
-That is a real bug. After a unique violation, do not return the in-memory id, and do not keep using that `DbContext` to `Find`. Resolve the winner through a query that does not depend on the dirty tracker, or fail the request and let the client retry. The clean version opens the lookup on a context that did not track the loser. `IDbContextFactory` is one way. A simpler way that fits this guide: let the exception propagate as a 409 and tell the client to retry with the same key. The retry hits `FindAsync` and returns the winner. You lose the "transparent replay" on the racing request only.
-
-```C#
-catch (UniqueConstraintViolationException)
-{
-    throw new ConflictException("This idempotency key is already in use. Retry the request.");
-}
-```
-
-Document the client contract: same key, same body, safe to retry. Same key and a **different** body is a conflict. Compare a hash of the body if you need to detect that, stored next to the key. Returning the old order id for a different cart is a quiet data bug.
+Idempotency is application request semantics. Keeping its key/hash on `Order` makes this excerpt compact; a separate receipt table, committed with the order, often gives cleaner ownership and preserves replay results independently of an order's lifecycle.
 
 ### Two aggregates in one context
 
@@ -1647,7 +1694,7 @@ public sealed class CancelOrderHandler(
         var now = time.GetUtcNow();
         order.Cancel(now);
 
-        foreach (var line in order.Lines)
+        foreach (var line in order.Lines.OrderBy(line => line.ProductId.Value))
         {
             var stock = await stockItems.GetAsync(line.ProductId, cancellationToken)
                 ?? throw new DomainRuleException($"No stock row for {line.ProductId}.");
@@ -1720,7 +1767,7 @@ public sealed class LoggingHandler<TCommand, TResult>(
 
 Register the inner handler and decorate it the way [DotnetPattern.md](DotnetPattern.md#decorator-around-an-existing-registration) shows, or skip the interface and log inside the one handler you actually have. Add the pipeline when a second concern appears on every use case. A pipeline of ten behaviors for three handlers is a framework you now have to debug at 2 a.m.
 
-Do not inject `IMediator` into `Order` "so the domain can emit events the application handles before commit". Those handlers run before you know the commit succeeded.
+Keep dispatch outside `Order`. In-process domain-event handlers may run before commit when their work is confined to the same local transaction; external I/O must use a durable after-commit path. Before-commit dispatch needs explicit ordering, recursion, and rollback rules. Injecting a mediator into the aggregate hides those responsibilities.
 
 ### Registration
 
@@ -1757,6 +1804,7 @@ public sealed class OrderingDbContext(DbContextOptions<OrderingDbContext> option
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Stock> Stock => Set<Stock>();
     public DbSet<OutboxMessage> Outbox => Set<OutboxMessage>();
+    public DbSet<OrderSummary> OrderSummaries => Set<OrderSummary>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -1813,23 +1861,31 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
 {
     public void Configure(EntityTypeBuilder<Order> builder)
     {
-        builder.ToTable("orders");
+        builder.ToTable("orders", table => table.HasCheckConstraint("ck_orders_status",
+            "status IN ('Placed', 'Paid', 'Shipped', 'Cancelled', 'PaymentFailed')"));
         builder.HasKey(o => o.Id);
 
         builder.Property(o => o.Id)
+            .HasColumnName("id")
+            .ValueGeneratedNever()
             .HasConversion(id => id.Value, value => new OrderId(value));
         builder.Property(o => o.CustomerId)
+            .HasColumnName("customer_id")
             .HasConversion(id => id.Value, value => new CustomerId(value));
         builder.Property(o => o.Status)
+            .HasColumnName("status")
             .HasConversion<string>()
             .HasMaxLength(32);
         builder.Property(o => o.IdempotencyKey)
             .HasMaxLength(80)
             .HasColumnName("idempotency_key");
-        builder.HasIndex(o => o.IdempotencyKey)
+        builder.Property(o => o.RequestHash).HasMaxLength(64).HasColumnName("request_hash");
+        builder.HasIndex(o => new { o.CustomerId, o.IdempotencyKey })
+            .HasDatabaseName("ux_orders_customer_idempotency")
             .IsUnique()
             .HasFilter("idempotency_key IS NOT NULL");
 
+        builder.Property(o => o.PlacedAt).HasColumnName("placed_at");
         builder.Ignore(o => o.DomainEvents);
         builder.Ignore(o => o.Total);
         builder.Ignore(o => o.Currency);
@@ -1842,20 +1898,10 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
             address.Property(a => a.Country).HasMaxLength(2).HasColumnName("ship_country");
         });
 
-        builder.OwnsMany(o => o.Lines, line =>
-        {
-            line.ToTable("order_lines");
-            line.WithOwner().HasForeignKey("OrderId");
-            line.HasKey("OrderId", nameof(OrderLine.ProductId));
-            line.Property(l => l.ProductId)
-                .HasConversion(id => id.Value, value => new ProductId(value));
-            line.Property(l => l.ProductName).HasMaxLength(200);
-            line.ComplexProperty(l => l.UnitPrice, money =>
-            {
-                money.Property(m => m.Amount).HasPrecision(18, 2).HasColumnName("unit_price_amount");
-                money.Property(m => m.Currency).HasMaxLength(3).HasColumnName("unit_price_currency");
-            });
-        });
+        builder.HasMany(o => o.Lines)
+            .WithOne()
+            .HasForeignKey("OrderId")
+            .OnDelete(DeleteBehavior.Cascade);
 
         builder.Navigation(o => o.Lines)
             .UsePropertyAccessMode(PropertyAccessMode.Field);
@@ -1866,13 +1912,40 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
             .IsConcurrencyToken();
     }
 }
+
+public sealed class OrderLineConfiguration : IEntityTypeConfiguration<OrderLine>
+{
+    public void Configure(EntityTypeBuilder<OrderLine> line)
+    {
+        line.ToTable("order_lines", table =>
+        {
+            table.HasCheckConstraint("ck_order_line_quantity", "quantity > 0");
+            table.HasCheckConstraint("ck_order_line_price", "unit_price_amount >= 0");
+        });
+        line.Property<OrderId>("OrderId").HasColumnName("order_id")
+            .HasConversion(id => id.Value, value => new OrderId(value));
+        line.HasKey("OrderId", nameof(OrderLine.ProductId));
+        line.Property(l => l.ProductId)
+            .HasColumnName("product_id")
+            .HasConversion(id => id.Value, value => new ProductId(value));
+        line.Property(l => l.ProductName).HasMaxLength(200).HasColumnName("product_name");
+        line.Property(l => l.Quantity).HasColumnName("quantity");
+        line.Ignore(l => l.LineTotal);
+        line.ComplexProperty(l => l.UnitPrice, money =>
+        {
+            money.Property(m => m.Amount).HasPrecision(18, 2).HasColumnName("unit_price_amount");
+            money.Property(m => m.Currency).HasMaxLength(3).HasColumnName("unit_price_currency");
+        });
+
+    }
+}
 ```
 
-`Ignore(DomainEvents)` keeps the in-memory list out of the table. `Ignore(Total)` and `Ignore(Currency)` keep calculated values out of the table. If you store `total` as a column for reporting, it is a denormalized cache you must update in `AddLine` and `ChangeQuantity`, and a query should still not trust it over the lines without a test. The sample calculates it.
+`Ignore(DomainEvents)` keeps the in-memory list out of the table. `Ignore(Total)` and `Ignore(Currency)` keep calculated values out of the table. If you store `total` as a column for reporting, it is a denormalized cache set at `Place` and updated by any future amendment, and a query should still not trust it over the lines without a test. The sample calculates it.
 
-`HasFilter` is raw SQL. It must name the **column**, not the C# property. Without `HasColumnName("idempotency_key")`, EF creates `"IdempotencyKey"` and PostgreSQL rejects the filter. The filter allows many orders with a null key (staff tools that are not retried) while real checkouts stay unique. PostgreSQL unique indexes treat nulls as distinct unless you use `NULLS NOT DISTINCT` (PostgreSQL 15+).
+`HasFilter` is raw SQL. It must name the **column**, not the C# property. Without `HasColumnName("idempotency_key")`, EF would otherwise create `"IdempotencyKey"` and PostgreSQL rejects the filter. The filter allows many orders with a null key (staff tools that are not retried) while real checkouts stay unique. PostgreSQL unique indexes treat nulls as distinct unless you use `NULLS NOT DISTINCT` (PostgreSQL 15+).
 
-`ComplexProperty` for `Address` stores columns on `orders`. `Address` is a `readonly record struct`, and `OwnsOne` only accepts a class. `OwnsMany` for lines stores `order_lines` with a composite key `(OrderId, ProductId)`, which matches "one product per order". `ComplexProperty` on the line stores `Money` the same way (EF Core 8). Neither value object gets its own id.
+`ComplexProperty` for `Address` stores columns on `orders`; `OwnsOne` requires a reference type. Lines are regular EF child entities in `order_lines`, keyed by `(OrderId, ProductId)` and loaded through the root repository. Being an EF entity does not make a child a DDD aggregate root. Configuring `Money` through `EntityTypeBuilder<OrderLine>.ComplexProperty` avoids assuming that `OwnedNavigationBuilder` exposes that API. Neither value object gets an id.
 
 SQL Server has no `xmin`. Use a rowversion instead, and do not add both:
 
@@ -1895,7 +1968,7 @@ Apply it in `ConfigureConventions` if many entities use `OrderId`. A converter t
 
 `HasConversion<string>()` on the enum stores `Placed`, not `0`. A reorder of the enum will not silently rewrite history. The cost is a wider column and an index on a string. That is the right trade for a status you will read in SQL during an incident.
 
-### Backing fields and owned lines
+### Backing fields and child lines
 
 `Lines` is `IReadOnlyList<OrderLine>` with no setter. EF cannot assign the property. `UsePropertyAccessMode(PropertyAccessMode.Field)` tells it to fill `_lines`. The field name `_lines` matches EF's convention for a property `Lines`. If you name the field `items`, configure it:
 
@@ -1904,7 +1977,7 @@ builder.Metadata.FindNavigation(nameof(Order.Lines))!
     .SetField("items");
 ```
 
-`Include(o => o.Lines)` on a repository `Get` is explicit. Owned collections are not always loaded the way people remember from one EF version to the next. Include them in the aggregate repository so `Cancel` sees the lines it must release. A query DTO should project in SQL and not rely on this include.
+The ordinary child navigation in this mapping needs `Include(o => o.Lines)` so the loaded aggregate contains its lines. If you use EF owned entities instead, owned navigations are automatically included with their owner; do not confuse that behavior with regular relationships. See [owned entity types](https://learn.microsoft.com/en-us/ef/core/modeling/owned-entities). Include them in the aggregate repository so `Cancel` sees the lines it must release. A query DTO should project in SQL and not rely on this include.
 
 Lazy-loading proxies are how a handler touches `order.Customer.Address` and runs SQL from a loop. Leave them off. If a use case needs another aggregate, the handler calls that aggregate's repository.
 
@@ -1925,12 +1998,15 @@ Catch this in `EfUnitOfWork.CommitAsync` so handlers stay free of EF types. Retr
 
 `Stock` needs the same token. Two checkouts reading `Available == 1` will both pass `Reserve` in memory. The token makes the second commit fail. Without the token, `Reserved` loses an increment.
 
+A token on the root row is checked only when that row is updated/deleted. It does not automatically protect a future change to child rows alone. If amendments are added, update a root revision or use an explicit aggregate concurrency protocol in the same transaction. This sample fixes lines after placement and each status transition writes the root. See [EF concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency) and [Npgsql xmin mapping](https://www.npgsql.org/efcore/modeling/concurrency.html).
+
 ```C#
 public sealed class StockConfiguration : IEntityTypeConfiguration<Stock>
 {
     public void Configure(EntityTypeBuilder<Stock> builder)
     {
-        builder.ToTable("stock");
+        builder.ToTable("stock", table => table.HasCheckConstraint(
+            "ck_stock_counts", "\"Reserved\" >= 0 AND \"OnHand\" >= \"Reserved\""));
         builder.HasKey(s => s.ProductId);
         builder.Property(s => s.ProductId)
             .HasConversion(id => id.Value, value => new ProductId(value));
@@ -1946,7 +2022,7 @@ public sealed class StockConfiguration : IEntityTypeConfiguration<Stock>
 
 ### Global query filters
 
-A tenant filter and a soft-delete filter are infrastructure. They are also easy to get wrong. The `Order` in this guide has no `TenantId` until you add one; the filter below is the shape after that property exists.
+A tenant filter and a soft-delete filter are infrastructure. They are also easy to get wrong. The `Order` in this guide has no `TenantId` until you add one; the filter below is the shape after that property exists. The filter must be configured from the context's `OnModelCreating`, not by an unrelated configuration object capturing its own tenant.
 
 #### ❌ BAD — the first tenant is compiled into the model
 
@@ -1955,7 +2031,7 @@ var tenantId = _tenant.TenantId;
 builder.HasQueryFilter(o => o.TenantId == tenantId);
 ```
 
-`tenantId` is a local. EF bakes that value into the cached model, and every later context filters as whichever tenant built the model first.
+A captured value unrelated to the context instance can be retained in the cached model. Do not rely on a local captured by a configuration object to supply the current request's tenant; bind the predicate to a context member as in the documented pattern.
 
 :white_check_mark: **GOOD** Close over a property of this `DbContext`. EF parameterizes it and reads it again on each query.
 
@@ -1967,7 +2043,7 @@ builder.HasQueryFilter(o => o.TenantId == CurrentTenantId);
 
 `IgnoreQueryFilters()` on a repository method is a loaded gun. An admin report that calls it without a new tenant predicate will return every tenant's orders. Prefer a separate `OrderingAdminDbContext` with no filter, registered only in the admin host, over a boolean `includeAllTenants` on the application repository.
 
-Soft delete is a filter of `DeletedAt == null`, which hides those rows from `GetAsync`. The handler then throws `NotFoundException` and the unique index on `IdempotencyKey` still sees the row. The client retries the key, the pre-check finds nothing, the insert fails the unique index. If you soft-delete orders, the unique index has to match the filter (`WHERE deleted_at IS NULL`) or you clear the key on delete. The aggregate method is `Cancel`, not `Delete`. Prefer a terminal status over a hidden row for orders you must still show on a receipt.
+Soft delete is a filter of `DeletedAt == null`, which hides those rows from `GetAsync`. The handler then throws `NotFoundException` and the unique index on `IdempotencyKey` still sees the row. The client retries the key, the pre-check finds nothing, the insert fails the unique index. Keep idempotency receipts discoverable independently of the soft-delete filter. A partial index on live rows or clearing the key frees it for reuse and can create a second order; use that only if the documented retry window has ended and reuse is intentional. The aggregate method is `Cancel`, not `Delete`. Prefer a terminal status over a hidden row for orders you must still show on a receipt.
 
 ### Repository
 
@@ -1988,15 +2064,11 @@ public sealed class EfOrderRepository(OrderingDbContext db) : IOrderRepository
 
 public sealed class EfIdempotencyStore(OrderingDbContext db) : IIdempotencyStore
 {
-    public async Task<OrderId?> FindAsync(string key, CancellationToken cancellationToken)
-    {
-        var id = await db.Orders.AsNoTracking()
-            .Where(o => o.IdempotencyKey == key)
-            .Select(o => (Guid?)o.Id.Value)
+    public Task<IdempotencyRecord?> FindAsync(CustomerId customerId, string key, CancellationToken cancellationToken) =>
+        db.Orders.AsNoTracking()
+            .Where(o => o.CustomerId == customerId && o.IdempotencyKey == key)
+            .Select(o => new IdempotencyRecord(o.Id, o.RequestHash))
             .SingleOrDefaultAsync(cancellationToken);
-
-        return id is null ? null : new OrderId(id.Value);
-    }
 }
 
 public sealed class EfUnitOfWork(OrderingDbContext db) : IUnitOfWork
@@ -2011,7 +2083,8 @@ public sealed class EfUnitOfWork(OrderingDbContext db) : IUnitOfWork
         {
             throw new ConflictException("The row was updated by someone else. Reload and retry.");
         }
-        catch (DbUpdateException ex) when (PostgresUniqueViolation.Is(ex))
+        catch (DbUpdateException ex) when (ex.InnerException is Npgsql.PostgresException
+            { SqlState: "23505", ConstraintName: "ux_orders_customer_idempotency" })
         {
             throw new UniqueConstraintViolationException();
         }
@@ -2021,7 +2094,7 @@ public sealed class EfUnitOfWork(OrderingDbContext db) : IUnitOfWork
 
 `AddAsync` does not call `SaveChanges`. `GetAsync` tracks. `FindAsync` for idempotency uses `AsNoTracking` so a lookup is not a second tracked `Order` fighting the one you are inserting.
 
-`PostgresUniqueViolation.Is` reads the inner `PostgresException.SqlState == "23505"`. Keep that type in infrastructure. `UniqueConstraintViolationException` is the application type.
+The filtered catch recognizes the named idempotency index only. Keep `PostgresException` in infrastructure. `UniqueConstraintViolationException` is the application type.
 
 `IPriceList` reading a catalog table:
 
@@ -2041,7 +2114,7 @@ public sealed class EfPriceList(OrderingDbContext db) : IPriceList
 }
 ```
 
-`CatalogPriceRow` is a persistence type in infrastructure, mapped to a table or view the catalog context owns and this context may only read. It is not a domain entity and it has no `Reserve` method. Do not add `DbSet<Product>` to `OrderingDbContext` and navigate from `OrderLine` to it. The moment you do, ordering migrations start altering the catalog table.
+`CatalogPriceRow` is a persistence type in infrastructure, mapped to a published view with `ToView`, or to a table with `ToTable("catalog_prices", "catalog", table => table.ExcludeFromMigrations())` that this context may only read. It is not a domain entity and it has no `Reserve` method. Do not add `DbSet<Product>` to `OrderingDbContext` and navigate from `OrderLine` to it. The moment you do, ordering migrations start altering the catalog table.
 
 If the price list is HTTP, `HttpPriceList` implements the same port, translates the vendor JSON in this class, and times out with a `CancellationToken`. The handler does not change. See [HttpClientGuidance.md](HttpClientGuidance.md) for the client lifetime. Do not new up `HttpClient` inside the adapter.
 
@@ -2091,10 +2164,24 @@ public static class OrderEndpoints
             if (string.IsNullOrWhiteSpace(key))
                 return Results.Problem(title: "Missing idempotency key", statusCode: StatusCodes.Status400BadRequest);
 
+            if (request.ShipTo is null || request.Lines is null || request.Lines.Any(line => line is null))
+                return Results.Problem(title: "Shipping address and lines are required", statusCode: 400);
+
+            Address address;
+            try
+            {
+                address = new Address(request.ShipTo.Line1, request.ShipTo.City,
+                    request.ShipTo.PostalCode, request.ShipTo.Country);
+            }
+            catch (ArgumentException)
+            {
+                return Results.Problem(title: "Invalid shipping address", statusCode: 400);
+            }
+
             var actor = http.ToActor();
             var command = new PlaceOrder(
                 new CustomerId(request.CustomerId),
-                new Address(request.ShipTo.Line1, request.ShipTo.City, request.ShipTo.PostalCode, request.ShipTo.Country),
+                address,
                 request.Lines.Select(l => new PlaceOrderLine(new ProductId(l.ProductId), l.Quantity)).ToArray(),
                 key,
                 actor);
@@ -2116,7 +2203,7 @@ public static class OrderEndpoints
 }
 ```
 
-`ToActor()` reads claims and returns `Actor`. It lives in the API project. A missing claim is 401 from the auth middleware, not a domain exception.
+`ToActor()` derives identity, role, and customer ownership from verified claims. It lives in the API project. Configure authentication and authorization services, middleware, and `.RequireAuthorization()` on these routes (omitted from the excerpt). Missing claims are rejected only when the configured policy requires them; registering middleware alone does not secure every endpoint. Buyer ownership is checked again in the handler.
 
 Do not serialize `Order` as the response. The JSON shape becomes a public contract: private events, `ShipTo`, internal status names, whatever you add next month. `PlaceOrderResponse` is the contract. You can add a field to `Order` without breaking clients.
 
@@ -2138,6 +2225,7 @@ public sealed class DomainExceptionHandler : IExceptionHandler
             ForbiddenException => (StatusCodes.Status403Forbidden, "Forbidden"),
             DomainRuleException => (StatusCodes.Status400BadRequest, "Rule violated"),
             ConflictException => (StatusCodes.Status409Conflict, "Conflict"),
+            PaymentNoLongerAcceptedException => (StatusCodes.Status409Conflict, "Payment needs reconciliation"),
             _ => (0, "")
         };
 
@@ -2146,7 +2234,7 @@ public sealed class DomainExceptionHandler : IExceptionHandler
 
         await Results.Problem(
                 title: title,
-                detail: exception.Message,
+                detail: exception is ForbiddenException ? null : exception.Message,
                 statusCode: status)
             .ExecuteAsync(httpContext);
 
@@ -2157,7 +2245,7 @@ public sealed class DomainExceptionHandler : IExceptionHandler
 
 `detail: exception.Message` is acceptable for `DomainRuleException` because you wrote those messages for a caller. Do not do it for unexpected exceptions. Returning `false` lets the generic handler produce a 500 without a stack trace in the body. Register `AddProblemDetails()` and `UseExceptionHandler()`.
 
-`ForbiddenException` in the sample has no message. `detail` will be empty. That is fine. Do not put "you are not the buyer of order X" in a message a different user can read if you chose 404-style hiding. This sample uses 403 and a generic title.
+`ForbiddenException` in the sample inherits the generic exception message; omit `detail` for it rather than exposing that unhelpful default. That is fine. Do not put "you are not the buyer of order X" in a message a different user can read if you chose 404-style hiding. This sample uses 403 and a generic title.
 
 ### Strongly typed ids on the route
 
@@ -2168,8 +2256,12 @@ JSON bodies do not use `TryParse`. A request DTO in this sample uses `Guid` and 
 ```C#
 public sealed class OrderIdJsonConverter : JsonConverter<OrderId>
 {
-    public override OrderId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
-        new(reader.GetGuid());
+    public override OrderId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.String || !reader.TryGetGuid(out var value) || value == Guid.Empty)
+            throw new JsonException("A non-empty order id is required.");
+        return new OrderId(value);
+    }
 
     public override void Write(Utf8JsonWriter writer, OrderId value, JsonSerializerOptions options) =>
         writer.WriteStringValue(value.Value);
@@ -2184,9 +2276,27 @@ One converter per id type, or a factory converter. Do not `ToString()` an `Order
 
 ### Query objects
 
+A read port can project directly from mapped columns. Do not navigate through `o.Id.Value` in a LINQ predicate when `Id` is mapped with a value converter: EF cannot generally query members inside a converted scalar. Compare the whole `OrderId` for equality in command repositories. For the list, this example uses a live SQL view with primitive columns and a keyless read type. It adds no asynchronously maintained read table.
+
+Create this view in the Ordering migration, using the column names from the mapping:
+
+```sql
+CREATE VIEW ordering.order_summary AS
+SELECT o.id, o.customer_id, o.status, o.placed_at,
+       MIN(l.unit_price_currency) AS currency,
+       SUM(l.unit_price_amount * l.quantity) AS total,
+       COUNT(*)::integer AS line_count
+FROM ordering.orders AS o
+JOIN ordering.order_lines AS l ON l.order_id = o.id
+GROUP BY o.id, o.customer_id, o.status, o.placed_at;
+```
+
+The aggregate guarantees at least one line and one currency. The view sums already-rounded, two-decimal unit prices multiplied by integer quantities, so it matches this sample's `Money.Times`. If pricing/tax rounding changes, change and verify both representations.
+
 ```C#
 public sealed record OrderSummary(
     Guid Id,
+    Guid CustomerId,
     string Status,
     string Currency,
     decimal Total,
@@ -2204,18 +2314,26 @@ public interface IOrderQueries
         CancellationToken cancellationToken);
 }
 
+public sealed class OrderSummaryConfiguration : IEntityTypeConfiguration<OrderSummary>
+{
+    public void Configure(EntityTypeBuilder<OrderSummary> builder)
+    {
+        builder.HasNoKey();
+        builder.ToView("order_summary", "ordering");
+        builder.Property(row => row.Id).HasColumnName("id");
+        builder.Property(row => row.CustomerId).HasColumnName("customer_id");
+        builder.Property(row => row.Status).HasColumnName("status");
+        builder.Property(row => row.Currency).HasColumnName("currency");
+        builder.Property(row => row.Total).HasColumnName("total");
+        builder.Property(row => row.LineCount).HasColumnName("line_count");
+        builder.Property(row => row.PlacedAt).HasColumnName("placed_at");
+    }
+}
+
 public sealed class EfOrderQueries(OrderingDbContext db) : IOrderQueries
 {
     public Task<OrderSummary?> GetSummaryAsync(OrderId id, CancellationToken cancellationToken) =>
-        db.Orders.AsNoTracking()
-            .Where(o => o.Id == id)
-            .Select(o => new OrderSummary(
-                o.Id.Value,
-                o.Status.ToString(),
-                o.Lines.Select(l => l.UnitPrice.Currency).FirstOrDefault() ?? "",
-                o.Lines.Sum(l => l.UnitPrice.Amount * l.Quantity),
-                o.Lines.Count,
-                o.PlacedAt))
+        db.OrderSummaries.Where(row => row.Id == id.Value)
             .SingleOrDefaultAsync(cancellationToken);
 
     public async Task<IReadOnlyList<OrderSummary>> ListByCustomerAsync(
@@ -2225,34 +2343,27 @@ public sealed class EfOrderQueries(OrderingDbContext db) : IOrderQueries
         int limit,
         CancellationToken cancellationToken)
     {
-        var query = db.Orders.AsNoTracking().Where(o => o.CustomerId == customerId);
+        if (limit is < 1 or > 100)
+            throw new DomainRuleException("Limit must be between 1 and 100.");
+        if (placedBefore.HasValue != idBefore.HasValue)
+            throw new DomainRuleException("Both cursor components are required.");
 
-        if (placedBefore is not null && idBefore is not null)
+        var query = db.OrderSummaries.Where(row => row.CustomerId == customerId.Value);
+        if (placedBefore is { } cursorTime && idBefore is { } cursorId)
         {
-            query = query.Where(o =>
-                o.PlacedAt < placedBefore
-                || (o.PlacedAt == placedBefore && o.Id.Value.CompareTo(idBefore.Value) < 0));
+            // Npgsql row comparison uses the same database ordering as ORDER BY.
+            query = query.Where(row => EF.Functions.LessThan(
+                ValueTuple.Create(row.PlacedAt, row.Id), ValueTuple.Create(cursorTime, cursorId)));
         }
-
-        return await query
-            .OrderByDescending(o => o.PlacedAt)
-            .ThenByDescending(o => o.Id)
-            .Take(limit)
-            .Select(o => new OrderSummary(
-                o.Id.Value,
-                o.Status.ToString(),
-                o.Lines.Select(l => l.UnitPrice.Currency).FirstOrDefault() ?? "",
-                o.Lines.Sum(l => l.UnitPrice.Amount * l.Quantity),
-                o.Lines.Count,
-                o.PlacedAt))
-            .ToListAsync(cancellationToken);
+        return await query.OrderByDescending(row => row.PlacedAt)
+            .ThenByDescending(row => row.Id).Take(limit).ToListAsync(cancellationToken);
     }
 }
 ```
 
-The projection runs in SQL. `AsNoTracking` keeps the identity map out of a read. The interface returns `OrderSummary`, not `Order`.
+Keyless types are not tracked. The port returns `OrderSummary` and loads no aggregate graph. SQL Server needs its own supported comparison predicate; this tuple expression is Npgsql-specific. Check the actual generated SQL and execution plan: a grouped view may still aggregate many lines, so a stored total or a separate summary table may be appropriate for a busy list. See [EF value-conversion limitations](https://learn.microsoft.com/en-us/ef/core/modeling/value-conversions) and [Npgsql row comparisons](https://www.npgsql.org/efcore/mapping/translations.html#row-value-comparisons).
 
-`Sum` in the projection duplicates `Order.Total`. That is the cost of not loading the aggregate. If the rounding rule changes, update `Money.Times` and this projection together, and pin both with a test. Storing `total_amount` on the order at write time removes the duplication and makes the list query an index-only-friendly column. Then the write model is responsible for keeping the column equal to the lines. Pick one. Do not calculate it in the UI from a payload that might be stale and also store a different total.
+Read adapters still need ownership/tenant authorization. A DTO projection or raw SQL does not inherit every filter you configured on `Order`; add the tenant to this view/read mapping when tenancy is introduced.
 
 ### Keyset pagination
 
@@ -2263,7 +2374,7 @@ GET /customers/{customerId}/orders?limit=20
 GET /customers/{customerId}/orders?limit=20&placedBefore=2026-09-01T00:00:00Z&idBefore={lastId}
 ```
 
-The `OR` predicate in the sample matches that order. Index `(customer_id, placed_at DESC, id DESC)`. The indexing guide covers why a leading range kills the rest of a composite index; here the customer id is equality and the timestamps are the range, which is the shape you want. See [Database_Indexing.md](Database_Indexing.md).
+The tuple comparison in the sample matches that order. Index `(customer_id, placed_at DESC, id DESC)`. The indexing guide explains how a leading range can limit the later keys' ability to narrow an index scan; here the customer id is equality and the timestamps are the range, which is the shape you want. See [Database_Indexing.md](Database_Indexing.md).
 
 Cap `limit` (for example at 100) in the endpoint. A client that sends `limit=1000000` will get a capped query, not a bigger one.
 
@@ -2295,7 +2406,7 @@ Do not point EF's `Order` aggregate at the summary table. Two models, two types.
 
 | Kind | Who raises it | Who sees it | Example |
 |------|---------------|-------------|---------|
-| Domain event | Aggregate method | In-process, after you copy it to the outbox. Not a public schema | `OrderPlaced` with `OrderId` struct |
+| Domain event | Aggregate method | Inside the context; dispatch timing is an explicit transaction choice. Not a public schema | `OrderPlaced` with `OrderId` struct |
 | Integration event | Mapper in infrastructure, from a domain event | Other contexts and other services | `ordering.order_placed.v1` with `Guid` fields |
 | Application notification | A handler, rarely | In-process UI cache bust, metrics | Prefer the integration event so a restart does not drop it |
 
@@ -2321,6 +2432,8 @@ public sealed record OrderShippedV1(Guid EventId, Guid OrderId, DateTimeOffset O
 Map it in infrastructure when you write the outbox, or map it in the publisher. Mapping at write time freezes the contract into the row. Mapping at publish time lets you fix a mapper bug without a backfill, and it also lets you publish a different contract than you stored if you are not careful. This sample stores the **integration** payload, produced by a mapper next to the interceptor, so the row is what you will send.
 
 The domain event still exists. The mapper reads it. `Order` does not reference `OrderPlacedV1`.
+
+The published payload here is intentionally minimal. Billing that needs product/tax lines requires the committed line/price snapshots in an agreed contract, or an authorized query for that immutable snapshot. Do not recalculate an old invoice from today's catalog price. Version an existing published contract when that change is breaking.
 
 ### Stable event names
 
@@ -2356,13 +2469,12 @@ public static class IntegrationEvents
             shipped.EventId,
             shipped.OrderId.Value,
             shipped.OccurredAt))),
-        OrderQuantityChanged => null,
         _ => throw new InvalidOperationException($"No integration mapping for {domainEvent.GetType().Name}.")
     };
 }
 ```
 
-The default arm throws. `MarkPaid`, `Ship`, and `MarkPaymentFailed` each raise an event, so those arms have to exist or the commit that follows the handler throws. `OrderQuantityChanged` returns null: it stays inside the module. A new domain event fails the commit until you either map it or add an explicit skip. Do not skip by accident of `GetType().Name`.
+The default arm throws. `MarkPaid`, `Ship`, and `MarkPaymentFailed` each raise an event, so those arms have to exist or the commit that follows the handler throws. Events deliberately kept local need an explicit `null` arm. A new domain event fails the commit until you either map it or add an explicit skip. Do not skip by accident of `GetType().Name`.
 
 `v1` stays forever. A breaking change is `ordering.order_placed.v2`. Publish both during a migration window, or publish v2 and let consumers you still own move first. Do not edit the fields of v1 in place.
 
@@ -2377,6 +2489,8 @@ public sealed class OutboxMessage
     public DateTimeOffset OccurredAt { get; private set; }
     public DateTimeOffset? ProcessedAt { get; private set; }
     public DateTimeOffset? LockedUntil { get; private set; }
+    public Guid? LockToken { get; private set; }
+    public DateTimeOffset AvailableAt { get; private set; }
     public int Attempts { get; private set; }
     public string? LastError { get; private set; }
 
@@ -2385,27 +2499,12 @@ public sealed class OutboxMessage
         Id = id,
         Type = type,
         Payload = payload,
-        OccurredAt = occurredAt
+        OccurredAt = occurredAt,
+        AvailableAt = occurredAt
     };
 
-    public void MarkProcessed(DateTimeOffset now)
-    {
-        ProcessedAt = now;
-        LockedUntil = null;
-    }
+    // Delivery updates are conditional SQL owned by OutboxProcessor.
 
-    public void MarkFailed(string error, DateTimeOffset now)
-    {
-        LastError = error.Length > 500 ? error[..500] : error;
-        LockedUntil = null;
-        _ = now;
-    }
-
-    public void Claim(DateTimeOffset now, TimeSpan lease)
-    {
-        Attempts += 1;
-        LockedUntil = now.Add(lease);
-    }
 }
 
 public sealed class OutboxMessageConfiguration : IEntityTypeConfiguration<OutboxMessage>
@@ -2420,13 +2519,17 @@ public sealed class OutboxMessageConfiguration : IEntityTypeConfiguration<Outbox
         builder.Property(m => m.OccurredAt).HasColumnName("occurred_at");
         builder.Property(m => m.ProcessedAt).HasColumnName("processed_at");
         builder.Property(m => m.LockedUntil).HasColumnName("locked_until");
+        builder.Property(m => m.LockToken).HasColumnName("lock_token");
+        builder.Property(m => m.AvailableAt).HasColumnName("available_at");
+        builder.HasIndex(m => new { m.AvailableAt, m.OccurredAt, m.Id })
+            .HasFilter("processed_at IS NULL");
         builder.Property(m => m.Attempts).HasColumnName("attempts");
         builder.Property(m => m.LastError).HasMaxLength(500).HasColumnName("last_error");
     }
 }
 ```
 
-`Id` is the domain event's `EventId`, not a new guid. Republish is the same id. `MarkFailed` keeps `ProcessedAt` null so the worker retries. The `FromSql` later in this section selects `id`, `locked_until`, and the other snake_case names. Those strings match `HasColumnName`. `jsonb` is PostgreSQL; on SQL Server store `Payload` as `nvarchar(max)`.
+`Id` is the domain event's `EventId`, not a new guid. Republish uses the same id. `LockToken` identifies the current claim; `AvailableAt` provides retry backoff independently of the lease. The worker SQL uses the explicitly mapped snake_case columns. `jsonb` is PostgreSQL; use the appropriate JSON/text mapping on another provider.
 
 The original guide copied events inside `EfUnitOfWork` before `SaveChanges`. That works until a caller calls `db.SaveChangesAsync` directly and the outbox stays empty. The interceptor runs for every save on this context.
 
@@ -2435,200 +2538,234 @@ The original guide copied events inside `EfUnitOfWork` before `SaveChanges`. Tha
 ```C#
 public sealed class OutboxInterceptor : SaveChangesInterceptor
 {
-    public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
-        DbContextEventData eventData,
-        InterceptionResult<int> result,
-        CancellationToken cancellationToken = default)
+    public override InterceptionResult<int> SavingChanges(DbContextEventData data, InterceptionResult<int> result)
     {
-        var db = (OrderingDbContext)eventData.Context!;
-        Stage(db);
-        return base.SavingChangesAsync(eventData, result, cancellationToken);
+        Stage((OrderingDbContext)data.Context!);
+        return result;
+    }
+
+    public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+        DbContextEventData data, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+    {
+        Stage((OrderingDbContext)data.Context!);
+        return ValueTask.FromResult(result);
     }
 
     private static void Stage(OrderingDbContext db)
     {
-        var orders = db.ChangeTracker.Entries<Order>()
-            .Select(entry => entry.Entity)
-            .Where(order => order.DomainEvents.Count > 0)
-            .ToArray();
-
-        foreach (var order in orders)
+        foreach (var order in db.ChangeTracker.Entries<Order>().Select(entry => entry.Entity).ToArray())
         {
             foreach (var domainEvent in order.DomainEvents)
             {
                 if (db.Outbox.Local.Any(message => message.Id == domainEvent.EventId))
                     continue;
-
                 var mapped = IntegrationEvents.From(order, domainEvent);
-                if (mapped is null)
-                    continue;
-
-                db.Outbox.Add(OutboxMessage.Create(
-                    domainEvent.EventId, mapped.Value.Name, mapped.Value.Payload, domainEvent.OccurredAt));
+                if (mapped is { } integration)
+                    db.Outbox.Add(OutboxMessage.Create(domainEvent.EventId,
+                        integration.Name, integration.Payload, domainEvent.OccurredAt));
             }
         }
+        // Stock facts are deliberately local in this sample, with no integration mapper.
+    }
+
+    private static void ClearAfterAutomaticCommit(OrderingDbContext db)
+    {
+        // SavedChanges is not the commit of an enclosing explicit/ambient transaction.
+        if (db.Database.CurrentTransaction is not null || System.Transactions.Transaction.Current is not null)
+            return;
+        foreach (var entry in db.ChangeTracker.Entries<IHasDomainEvents>())
+            entry.Entity.ClearEvents();
+    }
+
+    public override int SavedChanges(SaveChangesCompletedEventData data, int result)
+    {
+        ClearAfterAutomaticCommit((OrderingDbContext)data.Context!);
+        return result;
+    }
+
+    public override ValueTask<int> SavedChangesAsync(
+        SaveChangesCompletedEventData data, int result, CancellationToken cancellationToken = default)
+    {
+        ClearAfterAutomaticCommit((OrderingDbContext)data.Context!);
+        return ValueTask.FromResult(result);
     }
 }
 ```
 
-Adding `Outbox` rows inside `SavingChanges` includes them in the same `SaveChanges` and the same database transaction. If the commit fails, the outbox rows roll back with the order.
+The main handlers use one automatic `SaveChanges` transaction. Staged outbox rows commit or roll back with the order. Handling both synchronous and asynchronous interception avoids a hole when a caller uses `SaveChanges()`. `Outbox.Local` avoids restaging the same event on the same tracked context; retain events on failure and discard a failed unit of work.
 
-`Outbox.Local` is the set already tracked. A retry of `SaveChanges` on the same context must not insert a second copy of the same `EventId`. The `Id` primary key would also stop the duplicate at the database, but the exception would fail a commit that should have succeeded.
+For an explicit or ambient transaction, the transaction owner clears events **after its outer commit** and disposes the scope on rollback. `SavedChanges` alone is too early, and may already have accepted EF tracking state even if the outer transaction later rolls back. See [EF Core transactions](https://learn.microsoft.com/en-us/ef/core/saving/transactions). If you enable a retrying execution strategy, wrap an explicit transaction in that strategy and replay the complete unit of work with stable operation ids; do not merely retry the last save.
 
-Clear domain events only after a successful save. If you clear them in `SavingChanges` and the save throws, a retry has nothing to stage (the first staging already added outbox entities, so the `Local` check covers that path). If you clear them and also detach the outbox entities on failure, the events are gone. `SavedChangesAsync` is the place to clear:
+The mapper may read the current order here because this checkout fixes its lines at placement. If a future use case emits an event and then changes relevant fields before saving, put the fact's snapshot in the domain event instead. A later mapper must not reconstruct a historical price from current state.
 
-```C#
-public override ValueTask<int> SavedChangesAsync(
-    SaveChangesCompletedEventData eventData,
-    int result,
-    CancellationToken cancellationToken = default)
-{
-    var db = (OrderingDbContext)eventData.Context!;
-    foreach (var aggregate in db.ChangeTracker.Entries<IHasDomainEvents>().Select(e => e.Entity))
-        aggregate.ClearEvents();
-
-    return base.SavedChangesAsync(eventData, result, cancellationToken);
-}
-```
-
-`Stock` raises `StockReserved`, `StockReleased`, and `StockCommitted` in the same database as the order. This sample does not publish them: a warehouse service would need its own mapper, and that mapper must not query `Order` during `SavingChanges`. Clear them with the order events so the next save in the same context does not see a stale list. If the mapper's default arm throws, a stock event with no arm fails the commit. Give stock its own switch with an explicit `null` for events that stay local.
-
-Do not publish to a broker inside the interceptor. The broker call is slower than the transaction, and a failed HTTP call after a successful local insert is a different problem (the outbox worker's problem). The interceptor only inserts rows.
-
-`EfUnitOfWork` stays a `SaveChangesAsync` wrapper that translates concurrency and unique violations. It does not also copy events. One mechanism, or you will double-publish.
+This interceptor stages integration payloads; it does not dispatch local domain events or publish to a broker. `Stock` events are intentionally local. Add their own explicit mappings if another context needs them. One staging mechanism is enough; do not copy the same events again in `EfUnitOfWork`.
 
 ### Publish without holding the row lock
 
-A worker reads unpublished rows and sends them. Two workers must not send the same row at the same time and then both mark it processed. Holding `FOR UPDATE` while you call the broker keeps a row lock for the length of the HTTP call. Do not do that.
-
-Claim, commit, publish, mark:
+Claim in a short atomic statement, publish outside that transaction, and acknowledge only if the claim token still matches. A lease limits overlapping work; it cannot prevent duplicate delivery after a crash or slow broker call. This example claims one message at a time so a batch's later messages do not spend their entire lease waiting for earlier sends.
 
 ```C#
+public interface IIntegrationPublisher
+{
+    Task PublishAsync(string type, string payload, Guid eventId, CancellationToken cancellationToken);
+}
+
+public sealed record ClaimedOutbox(Guid Id, string Type, string Payload, int Attempts);
+
 public sealed class OutboxProcessor(
     IServiceScopeFactory scopes,
-    IIntegrationPublisher publisher,
-    TimeProvider time,
     ILogger<OutboxProcessor> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            var publishedAny = await PublishBatchAsync(stoppingToken);
-            if (!publishedAny)
-                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+            try
+            {
+                if (!await PublishOneAsync(stoppingToken))
+                    await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Outbox iteration failed; retrying");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
         }
     }
 
-    private async Task<bool> PublishBatchAsync(CancellationToken cancellationToken)
+    private async Task<bool> PublishOneAsync(CancellationToken cancellationToken)
     {
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
-        var now = time.GetUtcNow();
+        var publisher = scope.ServiceProvider.GetRequiredService<IIntegrationPublisher>();
+        var token = Guid.NewGuid();
 
-        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        // One PostgreSQL statement: select/lock, update the lease, return the claimed payload.
+        var claimed = await db.Database.SqlQuery<ClaimedOutbox>($"""
+            WITH candidate AS (
+                SELECT id FROM ordering.outbox_messages
+                WHERE processed_at IS NULL AND attempts < 10
+                  AND available_at <= clock_timestamp()
+                  AND (locked_until IS NULL OR locked_until <= clock_timestamp())
+                ORDER BY occurred_at, id
+                LIMIT 1 FOR UPDATE SKIP LOCKED
+            )
+            UPDATE ordering.outbox_messages AS m
+            SET lock_token = {token}, locked_until = clock_timestamp() + interval '2 minutes',
+                attempts = attempts + 1
+            FROM candidate AS c WHERE m.id = c.id
+            RETURNING m.id AS "Id", m.type AS "Type", m.payload AS "Payload", m.attempts AS "Attempts"
+            """).ToListAsync(cancellationToken);
 
-        var batch = await db.Outbox
-            .FromSqlInterpolated($"""
-                SELECT id, type, payload, occurred_at, processed_at, locked_until, attempts, last_error
-                FROM ordering.outbox_messages
-                WHERE processed_at IS NULL
-                  AND attempts < 10
-                  AND (locked_until IS NULL OR locked_until < now())
-                ORDER BY occurred_at
-                LIMIT 20
-                FOR UPDATE SKIP LOCKED
-                """)
-            .ToListAsync(cancellationToken);
-
-        if (batch.Count == 0)
-        {
-            await tx.RollbackAsync(cancellationToken);
+        if (claimed.Count == 0)
             return false;
-        }
-
-        foreach (var message in batch)
-            message.Claim(now, TimeSpan.FromMinutes(2));
-
-        await db.SaveChangesAsync(cancellationToken);
-        await tx.CommitAsync(cancellationToken);
-
-        foreach (var message in batch)
+        var message = claimed[0];
+        try
         {
-            try
-            {
-                await publisher.PublishAsync(message.Type, message.Payload, message.Id, cancellationToken);
-                message.MarkProcessed(time.GetUtcNow());
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                logger.LogWarning(ex, "Outbox publish failed for {EventId}", message.Id);
-                message.MarkFailed(ex.Message, time.GetUtcNow());
-            }
-        }
+            using var sendTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            sendTimeout.CancelAfter(TimeSpan.FromSeconds(30));
+            await publisher.PublishAsync(message.Type, message.Payload, message.Id, sendTimeout.Token);
 
-        await db.SaveChangesAsync(cancellationToken);
+            var updated = await db.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE ordering.outbox_messages
+                SET processed_at = clock_timestamp(), lock_token = NULL, locked_until = NULL, last_error = NULL
+                WHERE id = {message.Id} AND lock_token = {token} AND processed_at IS NULL
+                """, cancellationToken);
+            if (updated == 0)
+                logger.LogWarning("Outbox claim was replaced for {EventId}; consumer deduplication is required", message.Id);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw; // Keep the lease: delivery may already have succeeded.
+        }
+        catch (Exception ex)
+        {
+            var error = ex.Message.Length > 500 ? ex.Message[..500] : ex.Message;
+            var delaySeconds = Math.Min(300, 5 * (1 << Math.Min(message.Attempts, 6)));
+            logger.LogWarning(ex, "Outbox delivery/acknowledgement failed for {EventId}", message.Id);
+            await db.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE ordering.outbox_messages
+                SET lock_token = NULL, locked_until = NULL, last_error = {error},
+                    available_at = clock_timestamp() + ({delaySeconds} * interval '1 second')
+                WHERE id = {message.Id} AND lock_token = {token} AND processed_at IS NULL
+                """, cancellationToken);
+        }
         return true;
     }
 }
 ```
 
-Read this carefully before copying it.
+Use `ToListAsync` directly on this data-modifying SQL; composing LINQ over it would require a subquery that cannot contain this statement. PostgreSQL permits row-locking in suitable subqueries; the limitation is not a blanket ban on `FOR UPDATE` in every subquery. `SqlQuery` is parameterized interpolation, not string-built SQL, and returns an unmapped DTO rather than a tracked aggregate.
 
-`FOR UPDATE SKIP LOCKED` is PostgreSQL. SQL Server uses `READPAST` with different syntax. The `FromSqlInterpolated` query must be the whole statement EF executes. Do not append `.Where` or `.OrderBy` after it. EF wraps composed SQL in a subquery, and PostgreSQL rejects `FOR UPDATE` in a subquery.
+The database clock owns lease timestamps. If worker A's lease expires and B claims the row, B gets a new token; A's completion/failure update then affects zero rows and cannot clear B's lease. A can still have published, so delivery remains **at least once**. A broker acknowledgement proves acceptance, not consumer completion.
 
-The column list must match the table mapping, including column names EF expects. If the table is `outbox_messages` and the properties are `ProcessedAt`, configure column names or the reader will not bind. This is the fragile part of `FromSql`. A dedicated `ClaimBatch` SQL function in the database is often clearer than a mapped entity query. The behavior you want is: lock 20 unpublished rows, skip rows another worker has locked, do not block.
+Register `AddHostedService<OutboxProcessor>()` in a host that has the publisher adapter. Resolve scoped services inside the worker scope. If using MassTransit's Bus Outbox as well, the custom dispatcher must publish directly through the transport/`IBus`, not through the scoped outbox-aware `IPublishEndpoint`; otherwise it may stage another message and mark the original delivered without a broker send. Map each stored event name to its concrete contract, deserialize the payload, and set the transport `MessageId` to `EventId`.
 
-`Claim` increments `Attempts` and sets `LockedUntil` two minutes out, inside the short transaction. A crash after that commit and before publish still counts as an attempt. `processed_at` stays null. The next claim does not see the row until the lease expires, so a second worker does not publish the same message while the first is still in `PublishAsync`. If the first worker dies, the lease expires and the message is retried. `MarkFailed` clears `LockedUntil` so a known failure can be retried on the next poll instead of waiting out the lease. Consumers must still be idempotent: a slow publish can finish after the lease expired and a second worker may already have sent the same event.
-
-`IServiceScopeFactory` is required. `OutboxProcessor` is a singleton hosted service. `OrderingDbContext` is scoped. Do not inject `OrderingDbContext` into the hosted service constructor. See [AsyncGuidance.md](AsyncGuidance.md) for `BackgroundService` and [DotnetPattern.md](DotnetPattern.md#ihostedservice--backgroundservice).
-
-`IIntegrationPublisher` is a port. The RabbitMQ or Service Bus adapter lives in infrastructure. Publishing is at-least-once. The inbox makes it effectively once for the consumer's side effects.
+The pending-row index is a starting point; check its plan with real backlog sizes. Higher throughput can use parallel workers or a claimed batch with renewal and per-message tokens. Ordering across workers is not guaranteed by `ORDER BY occurred_at, id`. Required per-order sequencing needs an aggregate sequence and a partition/serialization policy.
 
 ### Inbox
 
-A consumer that sends email on `ordering.order_cancelled.v1` will send two emails if the publisher retries. Store the event id you already handled, in the same transaction as the side effect.
+The inbox deduplicates a consumer's **local transactional writes**. It cannot make an email, refund API, or other remote effect atomic with a database commit. Those effects need a downstream outbox and/or the provider's idempotency key.
 
 ```C#
 public sealed class InboxMessage
 {
+    public string Consumer { get; private set; } = "";
     public Guid EventId { get; private set; }
     public DateTimeOffset ProcessedAt { get; private set; }
 
-    public static InboxMessage Create(Guid eventId, DateTimeOffset now) => new()
+    public static InboxMessage Create(string consumer, Guid eventId, DateTimeOffset now) => new()
     {
-        EventId = eventId,
-        ProcessedAt = now
+        Consumer = consumer, EventId = eventId, ProcessedAt = now
     };
 }
 
 public sealed class OrderCancelledConsumer(BillingDbContext db, TimeProvider time)
 {
+    private const string Consumer = "billing.order_cancelled.v1";
+
     public async Task HandleAsync(OrderCancelledV1 message, CancellationToken cancellationToken)
     {
-        if (await db.Inbox.AnyAsync(i => i.EventId == message.EventId, cancellationToken))
+        if (await db.Inbox.AnyAsync(i => i.Consumer == Consumer && i.EventId == message.EventId, cancellationToken))
             return;
+        var invoice = await db.Invoices.SingleOrDefaultAsync(i => i.OrderId == message.OrderId, cancellationToken)
+            ?? throw new InvalidOperationException("Invoice has not arrived yet; retry with backoff.");
 
-        var invoice = await db.Invoices.SingleOrDefaultAsync(i => i.OrderId == message.OrderId, cancellationToken);
-        invoice?.VoidUnpaid();
-
-        db.Inbox.Add(InboxMessage.Create(message.EventId, time.GetUtcNow()));
-        await db.SaveChangesAsync(cancellationToken);
+        invoice.VoidUnpaid();
+        db.Inbox.Add(InboxMessage.Create(Consumer, message.EventId, time.GetUtcNow()));
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is Npgsql.PostgresException
+            { SqlState: "23505", ConstraintName: "pk_inbox_consumer_event" })
+        {
+            // This attempt rolled back; another committed this consumer/event receipt.
+            // End the consume scope without another save on this context.
+        }
     }
 }
 ```
 
-Unique primary key on `inbox.event_id`. The `AnyAsync` check plus the insert still races. The unique key is the authority. Catch `23505` and treat it as "already processed".
+Map a required `Consumer` column and composite primary key `(Consumer, EventId)` with `HasName("pk_inbox_consumer_event")`. A receipt keyed only by `EventId` in a shared inbox would incorrectly suppress a second distinct consumer of the same event. The pre-check still races; the named constraint is the authority. A competing invoice concurrency conflict is retried in a fresh consume scope.
 
-The consumer maps `OrderCancelledV1` into `Invoice.VoidUnpaid`. It does not new up `Ordering.Domain.Order`. Billing does not reference the ordering domain project. The message contract can live in a small `Ordering.Contracts` package that contains records and no behavior. Both sides may reference contracts. Neither side references the other's domain.
+Do not record success when a required invoice is missing: `order_cancelled` can arrive before `order_placed`. Keep it retryable or persist a pending transition with an explicit ordering policy. An already-voided invoice should accept a replay of the same cancellation.
+
+Billing translates the contract to its own model and references `Ordering.Contracts`, not `Ordering.Domain`. Set transport `MessageId` consistently with the event id. Retain receipts for the full redelivery/replay window; deleting them makes old messages executable again.
 
 ### Poison rows
 
 `attempts < 10` stops a message that will never succeed (a payload you cannot deserialize) from spinning forever. Those rows need a person. Log them with `EventId` and `LastError`. Do not delete them on the tenth failure; you will want the payload when you fix the mapper.
 
+Attempts count claims, including crashes before sending. Alert on exhausted rows after their last lease expires, oldest pending age, backlog growth, repeated failures, and stale saga states. Repair/replay preserves the original event id. Clean processed rows and inbox receipts only after the promised retention/replay window; a replay after receipt cleanup can repeat the consumer's work.
+
 A deserializer that throws is a failed attempt, not a process crash. Catch it inside the publish or consume loop. An uncaught exception in `BackgroundService.ExecuteAsync` stops the loop. The outbox then sits unpublished until the process restarts, and if you do not catch, it stops again. See the hosting notes in [AsyncGuidance.md](AsyncGuidance.md).
 
-Order of events for one order is usually the order you inserted them (`occurred_at`, then `id`). Across orders, consumers must not assume global order. `order_paid` can be delivered to billing before billing has consumed `order_placed` if you use two queues. The consumer that cannot find the invoice yet should retry (not mark the inbox done). A retry with backoff beats a permanent failure for a message that arrived early.
+Timestamp/UUID sorting is not a delivery-order guarantee. Concurrent workers, retries, separate queues, and producer clocks can reorder events, including for the same order. Carry an aggregate/business sequence where transitions require ordering, or handle missing dependencies and duplicates explicitly. `order_paid` can be delivered to billing before billing has consumed `order_placed` if you use two queues. The consumer that cannot find the invoice yet should retry (not mark the inbox done). A retry with backoff beats a permanent failure for a message that arrived early.
 
 ## Event sourcing
 
@@ -2657,7 +2794,7 @@ CREATE TABLE ordering.order_events (
 );
 ```
 
-`jsonb` is PostgreSQL. On SQL Server the payload is `nvarchar(max)`. The primary key is the concurrency control: two transactions cannot insert version 3 for the same stream.
+`jsonb` is PostgreSQL. On SQL Server the payload is `nvarchar(max)`. The primary key controls concurrent non-empty appends: two transactions cannot insert version 3 for the same stream. It does not check the expected version of an operation that appends no event.
 
 The event has to carry every fact the fold needs. The `OrderPlaced` used as a notification earlier in the guide only has an id and a time. That cannot rebuild lines, the ship-to address, or the price. The stored event is the full fact:
 
@@ -2705,8 +2842,16 @@ public sealed class Order
         IReadOnlyList<OrderLine> lines,
         DateTimeOffset now)
     {
+        ArgumentNullException.ThrowIfNull(lines);
         if (lines.Count == 0)
             throw new DomainRuleException("An order needs at least one line.");
+        if (id.Value == Guid.Empty || customerId.Value == Guid.Empty)
+            throw new DomainRuleException("Order and customer ids are required.");
+        shipTo.EnsureValid();
+        if (lines.Any(line => line is null) || lines.Select(line => line.ProductId).Distinct().Count() != lines.Count)
+            throw new DomainRuleException("A product appears on at most one line.");
+        if (lines.Select(line => line.UnitPrice.Currency).Distinct().Count() != 1)
+            throw new DomainRuleException("An order uses one currency.");
 
         var order = new Order();
         order.Raise(new StoredOrderPlaced(
@@ -2729,6 +2874,8 @@ public sealed class Order
 
     public void Cancel(DateTimeOffset now)
     {
+        if (Id.Value == Guid.Empty)
+            throw new DomainRuleException("An empty stream is not an order.");
         if (Status != OrderStatus.Placed)
             throw new DomainRuleException("Only a placed order can be cancelled.");
 
@@ -2831,7 +2978,7 @@ public sealed class EventOrderRepository(OrderingDbContext db)
 }
 ```
 
-Two cancels both read version 2. Both try to insert version 3. The primary key keeps one. The other is a 409, same as [two writers](#two-writers-one-row) on `xmin`. There is no `orders` row and no `xmin` on this stream. The version column is the token.
+Two cancels both read version 2. Both try to insert version 3. The primary key keeps one. The other is a 409, same as [two writers](#two-writers-one-row) on `xmin`. There is no `orders` row and no `xmin` on this stream. The version column is the token. Validate stream identity and contiguous versions when decoding history; an unknown type, corrupt payload, or missing event must surface as an integrity failure, not an invented state.
 
 Read the current max version in the same transaction if you want a clean conflict before the insert. The unique key is still the authority. A check-then-insert without that key loses the race the same way a missing idempotency index does. After a unique violation the `DbContext` is dirty. Dispose the scope and let the client retry. Do not call `SaveAsync` again on that context.
 
@@ -2859,11 +3006,11 @@ public sealed class StreamCheckpoint
 }
 ```
 
-The projector takes events with `version` greater than its checkpoint, updates `order_summaries`, and advances the checkpoint in the same transaction. A crash repeats the last event. The projection handles that the way the [inbox](#inbox) does: the write is keyed by `(stream_id, version)` so applying version 3 twice is a no-op.
+For each stream, the projector takes events in version order after its checkpoint, updates `order_summaries`, and advances a checkpoint keyed by `(Name, StreamId)` in the same transaction. A crash repeats the last event. The projection handles that the way the [inbox](#inbox) does: the write is keyed by `(stream_id, version)` so applying version 3 twice is a no-op.
 
 The list can lag the stream. A `GET` by id that must be current folds the stream in the command model. The list uses the projection. Do not query `order_events` with `OFFSET` to render a page. That reads every payload. The summary table is indexed the same way as any other list. See [Database_Indexing.md](Database_Indexing.md).
 
-Other modules still see `ordering.order_cancelled.v1`, not your stream table. A subscription that publishes integration events after the append commits is the outbox. You can use the stream itself as that queue if a worker reads past a global checkpoint. You still do not publish before the append commits.
+Other modules still see `ordering.order_cancelled.v1`, not your stream table. A durable event-store subscription can publish integration events after append. The minimal table above has no global subscription position: `(stream_id, version)` orders one stream only. Add an outbox in the append transaction, or use an event store with durable subscription/checkpoint semantics. A naive global checkpoint over a sequence/timestamp can skip a transaction that commits late.
 
 ### Snapshots and old payloads
 
@@ -2904,7 +3051,7 @@ Stay with the `orders` row and the outbox when:
 - the audit you need is "who called cancel", which an application log or one history table can hold
 - the aggregate is a hot counter (`Stock.Reserved`). A stream per SKU becomes the contention point, and the read you need is the current available count
 
-Move one aggregate to a stream when losing an intermediate state would cost a dispute or a fine, and you are willing to run projections for every screen. Do not convert Billing, Stock, and the product catalog in the same change.
+Consider event sourcing when replay and historical decision-making justify schema evolution, projections, and operational complexity. Transactional audit/history tables may also meet the business requirement; needing an audit trail does not by itself require event sourcing. Do not convert Billing, Stock, and the product catalog in the same change.
 
 #### ❌ BAD — two authorities
 
@@ -2964,21 +3111,25 @@ public sealed class PaymentNotificationHandler(
 
 `Unknown` does not change the order. A webhook you do not understand should be visible in logs and safe to replay once you add a mapping. Treating unknown as failure will cancel paid orders the day the vendor adds a status.
 
-The webhook endpoint in the API project authenticates the vendor (signature header), builds `VendorPaymentNotification`, and calls `IPaymentNotifications`. Signature checks are adapter code. They are not a method on `Order`.
+The webhook endpoint verifies the signature against the original body, authenticates the vendor, and durably records its notification id before acknowledging acceptance. Verify the payment reference/attempt, captured amount and currency, and ownership against server-side records before constructing a trusted `MarkOrderPaid` or `PaymentCaptured`. Signature validation alone does not prove that an arbitrary order reference belongs to this payment. This excerpt shows translation; receipt storage, verification, replay of unknown statuses, and reconciliation are additional required adapter/process work. Signature checks are not a method on `Order`.
 
-Outbound calls are the same shape in reverse. `IPaymentGateway.Authorize(orderId, money)` is a port. `StripePaymentGateway` maps `Money` to the vendor's minor units (cents as `long`) and their currency string. Multiplying decimal dollars by 100 in the domain "because Stripe wants cents" puts a vendor rule in `Order`. Do it in the gateway adapter, in one place, with a test for `10.10m` → `1010`.
+Outbound calls are the same shape in reverse. `IPaymentGateway.Authorize(orderId, money)` is a port. `ExamplePaymentGateway` maps `Money` to the vendor's minor units (cents as `long`) and their currency string. Multiplying decimal dollars by 100 in the domain "because Stripe wants cents" puts a vendor rule in `Order`. Do it in the gateway adapter, in one place, with a test for `10.10m` → `1010`.
 
 ```C#
-public static long ToMinorUnits(Money money) =>
-    money.Currency switch
+public static class PaymentAmounts
+{
+    public static long ToMinorUnits(Money money)
     {
-        "USD" or "EUR" => (long)(money.Amount * 100m),
-        "JPY" => (long)money.Amount,
-        _ => throw new DomainRuleException($"No minor-unit scale for {money.Currency}.")
-    };
+        money.EnsureValid();
+        var scaled = money.Amount * 100m; // supported USD/EUR only
+        if (scaled != decimal.Truncate(scaled))
+            throw new InvalidOperationException("Amount has unsupported fractional minor units.");
+        return checked((long)scaled);
+    }
+}
 ```
 
-Throw on a currency you have not classified. A default of "times 100" mis-charges yen by two digits.
+This sample supports USD/EUR only. Extending it to JPY or a three-decimal currency requires changing the money/precision policy as well as the adapter's scale. Reject unsupported scales and overflow; a cast that truncates fractions silently loses money. Real Stripe calls need the vendor's supported request encoding, authentication, payment confirmation flow, and idempotency contract; the fictional JSON endpoint above is not a Stripe API example.
 
 ## A payment process
 
@@ -2998,23 +3149,20 @@ public sealed class MarkOrderPaidHandler(
         var order = await orders.GetAsync(command.OrderId, cancellationToken)
             ?? throw new NotFoundException("Order was not found.");
 
-        if (order.Status == OrderStatus.Paid)
-            return;
+        if (order.Status is OrderStatus.Paid or OrderStatus.Shipped)
+            return; // A duplicate confirmed payment after shipping is still already applied.
 
+        if (order.Status is OrderStatus.Cancelled or OrderStatus.PaymentFailed)
+            throw new PaymentNoLongerAcceptedException("Payment captured after the order stopped accepting payment.");
         order.MarkPaid(time.GetUtcNow());
         await unitOfWork.CommitAsync(cancellationToken);
     }
 }
 ```
 
-The status check before `MarkPaid` makes the consumer idempotent at the domain level too: a second `CAPTURED` is a no-op, not a 400. `MarkPaid` itself still throws if the status is `Shipped` or `Cancelled`. A payment captured after cancel is an incident, not a silent success. The handler can branch:
+For a verified duplicate of the same payment, the status check avoids replaying the domain transition: a second `CAPTURED` is a no-op, not a 400. `MarkPaid` itself still guards the transition; the application recognizes an already-applied payment in `Paid` or `Shipped`. A new capture/attempt is not automatically a duplicate and needs a payment receipt/idempotency record. A payment captured after cancel or failure is an incident, not a silent success; the handler signals `PaymentNoLongerAcceptedException` so its driving adapter can durably arrange compensation.
 
-```C#
-if (order.Status == OrderStatus.Cancelled)
-    throw new ConflictException("Payment captured for a cancelled order.");
-```
-
-Someone has to refund. Hiding it inside `MarkPaid` by ignoring the call loses money. `ConflictException` on the webhook returns 409 so the vendor retries, which is noisy, or you record a `PaymentCapturedAfterCancel` event and return 200 so the vendor stops, while an operator queue picks up the event. Returning 200 and recording the event is the better webhook contract. Pick it explicitly in the adapter, not by swallowing exceptions.
+Someone has to refund. Hiding it inside `MarkPaid` by ignoring the call loses money. `PaymentNoLongerAcceptedException` on the webhook maps to 409 so the vendor retries, which is noisy, or you record a `PaymentCapturedAfterCancel` event and return 200 so the vendor stops, while an operator queue picks up the event. Returning 200 and recording the event is the better webhook contract. Pick it explicitly in the adapter, not by swallowing exceptions.
 
 Timeout:
 
@@ -3036,7 +3184,6 @@ public sealed class ExpireUnpaidOrders(
     {
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
-        var handler = scope.ServiceProvider.GetRequiredService<MarkOrderPaymentFailedHandler>();
         var cutoff = time.GetUtcNow().AddMinutes(-15);
 
         var ids = await db.Orders.AsNoTracking()
@@ -3048,13 +3195,12 @@ public sealed class ExpireUnpaidOrders(
 
         foreach (var id in ids)
         {
+            // A failed save leaves tracked state behind; every order needs a fresh scope.
+            await using var itemScope = scopes.CreateAsyncScope();
+            var handler = itemScope.ServiceProvider.GetRequiredService<MarkOrderPaymentFailedHandler>();
             try
             {
                 await handler.HandleAsync(new MarkOrderPaymentFailed(id), cancellationToken);
-            }
-            catch (DomainRuleException)
-            {
-                // Paid or cancelled between the query and the load.
             }
             catch (ConflictException)
             {
@@ -3065,7 +3211,36 @@ public sealed class ExpireUnpaidOrders(
 }
 ```
 
-`MarkOrderPaymentFailedHandler` calls `order.MarkPaymentFailed` and `stock.Release` for each line, then commits. The query uses `AsNoTracking` and only ids. Each id is its own transaction so one bad row does not roll back the batch. The domain exception means the row moved on; that is success for a sweeper.
+The query uses `AsNoTracking` and only ids. Each item gets a new scope/context; a failed stock update or concurrency conflict must not leave mutations that the next item's save accidentally commits. Treat only known state/concurrency conflicts as harmless; log and surface other failures rather than assuming every domain exception means "already paid". Run the timer with host-level error handling as for the outbox.
+
+```C#
+public sealed class MarkOrderPaymentFailedHandler(
+    IOrderRepository orders,
+    IStockRepository stockItems,
+    IUnitOfWork unitOfWork,
+    TimeProvider time)
+{
+    public async Task HandleAsync(MarkOrderPaymentFailed command, CancellationToken cancellationToken)
+    {
+        var order = await orders.GetAsync(command.OrderId, cancellationToken)
+            ?? throw new NotFoundException("Order was not found.");
+        if (order.Status != OrderStatus.Placed)
+            return; // Terminal/paid state: never release its stock again for a late failure.
+
+        var now = time.GetUtcNow();
+        order.MarkPaymentFailed(now);
+        foreach (var line in order.Lines.OrderBy(line => line.ProductId.Value))
+        {
+            var stock = await stockItems.GetAsync(line.ProductId, cancellationToken)
+                ?? throw new DomainRuleException($"No stock row for {line.ProductId}.");
+            stock.Release(line.Quantity, order.Id, now);
+        }
+        await unitOfWork.CommitAsync(cancellationToken);
+    }
+}
+```
+
+A late failure cannot undo `Paid`/`Shipped`. A later capture for `Cancelled`/`PaymentFailed` instead needs a durable refund/reconciliation workflow.
 
 Fifteen minutes is a product rule. It lives next to the sweeper, not inside `Order.Place`. The aggregate does not know the timeout. If you pass `payBy` into `Place` and store it, the aggregate can refuse `MarkPaid` after that instant. That is a stronger rule ("we do not take money after the reserve expired") and it belongs on `Order` if finance asked for it. The sweeper is what *causes* the failure in time. The method is what *allows* it.
 
@@ -3075,207 +3250,217 @@ When payment is a message on the bus, this sweeper and the saga must not both ex
 
 ## Saga with MassTransit
 
-A saga is the state of a process that spans more than one transaction. Here that process is: the order is placed, payment is requested, and either the capture arrives or fifteen minutes pass. MassTransit stores that state in a row and moves it with a state machine (`MassTransitStateMachine<T>`, in the main package since MassTransit 8). The messages are the facts. The saga decides which command to publish next. It does not decide whether an order is allowed to be paid.
+A saga records progress across several local transactions. It coordinates payment and compensation; it does not replace `Order`'s invariants or make a distributed transaction atomic. Use either the webhook/sweeper flow or the saga as the owner of payment expiry. Compensation (such as a refund) is another business operation that can fail and needs its own retries and reconciliation.
 
-`ExpireUnpaidOrders` is this process inside one database. Use that while a webhook in this process calls `MarkOrderPaidHandler`. Use the saga when a payment service publishes `PaymentCaptured` or `PaymentFailed` and this process must not poll. Once the saga owns the wait, the webhook adapter publishes `PaymentCaptured`. It does not call the handler, and the sweeper is off.
+The excerpts below use MassTransit 9.1 APIs with EF Core 10. Keep `MassTransit`, `MassTransit.RabbitMQ`, and `MassTransit.EntityFrameworkCore` on compatible versions. Version 9 has a commercial license; check the [official product/version guidance](https://masstransit.massient.com/) when selecting that dependency. The domain does not depend on this framework.
+
+Put message contracts in an explicit namespace such as `Ordering.Contracts`; MassTransit rejects message types in the global namespace. The excerpts omit repeated namespace/import declarations, so supply them when splitting the examples into files.
 
 ### The saga is not the aggregate
 
-| | `Order` | Payment saga |
-|--|---------|----------------|
-| Question | May this order be marked paid? | Did we ask for payment, and did the answer arrive in time? |
-| Store | `orders` row, or the event stream | `ordering.order_saga` |
-| Duplicate capture | `MarkPaid` is a no-op when status is already `Paid` | Second `PaymentCaptured` is ignored once the saga has left `AwaitingPayment` |
-| Capture after cancel | `ConflictException`, someone refunds | The saga publishes `RefundRequired` and does not publish `PayOrder` |
-
-The state machine lives in the infrastructure project. It references message contracts, not `Order`. A consumer is the driving adapter that calls the handler, the same way [the API](#the-api-is-an-adapter) does.
+`Order` answers whether a transition is legal. The saga tracks the request, the timeout, and whether the resulting order transition was confirmed. In particular, publishing `PayOrder` does **not** mean that the order is paid. This process keeps an `ApplyingPayment` state until it receives `OrderPaidV1` from the aggregate's committed outbox.
 
 ```C#
 public sealed record RequestPayment(Guid OrderId, decimal Amount, string Currency);
-public sealed record PaymentCaptured(Guid OrderId);
+public sealed record PaymentCaptured(Guid OrderId, string PaymentId);
 public sealed record PaymentFailed(Guid OrderId);
 public sealed record PaymentExpired(Guid OrderId);
-public sealed record PayOrder(Guid OrderId);
+public sealed record PayOrder(Guid OrderId, string PaymentId);
+public sealed record PayOrderRejected(Guid OrderId, string PaymentId);
 public sealed record FailOrderPayment(Guid OrderId);
-public sealed record RefundRequired(Guid OrderId);
+public sealed record RefundRequired(Guid OrderId, string PaymentId);
 
 public sealed class PayOrderConsumer(MarkOrderPaidHandler handler) : IConsumer<PayOrder>
 {
-    public Task Consume(ConsumeContext<PayOrder> context) =>
-        handler.HandleAsync(new MarkOrderPaid(new OrderId(context.Message.OrderId)), context.CancellationToken);
+    public async Task Consume(ConsumeContext<PayOrder> context)
+    {
+        try
+        {
+            await handler.HandleAsync(new MarkOrderPaid(new OrderId(context.Message.OrderId)), context.CancellationToken);
+        }
+        catch (PaymentNoLongerAcceptedException)
+        {
+            // No order mutation/save occurred. Persist these responses through the Consumer Outbox.
+            await context.Publish(new RefundRequired(context.Message.OrderId, context.Message.PaymentId));
+            await context.Publish(new PayOrderRejected(context.Message.OrderId, context.Message.PaymentId));
+        }
+    }
 }
 
-public sealed class FailOrderPaymentConsumer(MarkOrderPaymentFailedHandler handler)
-    : IConsumer<FailOrderPayment>
+public sealed class FailOrderPaymentConsumer(MarkOrderPaymentFailedHandler handler) : IConsumer<FailOrderPayment>
 {
     public Task Consume(ConsumeContext<FailOrderPayment> context) =>
-        handler.HandleAsync(
-            new MarkOrderPaymentFailed(new OrderId(context.Message.OrderId)),
-            context.CancellationToken);
+        handler.HandleAsync(new MarkOrderPaymentFailed(new OrderId(context.Message.OrderId)), context.CancellationToken);
 }
 ```
 
-`FailOrderPaymentConsumer` uses the same handler as `ExpireUnpaidOrders`: `MarkPaymentFailed` and `stock.Release`. `PayOrder` is not `Order.MarkPaid`. The handler still loads the aggregate and calls the method. A second delivery hits the handler's "already paid" return and commits nothing.
+These are trusted internal messages. The payment producer verifies the order/payment attempt and financial amount before producing `PaymentCaptured`; a string reference alone is insufficient. The payment service uses a stable key for `RequestPayment`, and the refund consumer uses `PaymentId` as its business idempotency key. The handler distinguishes `PaymentNoLongerAcceptedException` from an infrastructure concurrency `ConflictException`. The consumer persists refund/rejection responses for the former and lets the latter retry. Its Consumer Outbox registration appears below. Refund failure and exhausted message retries still need an error-queue monitor and reconciliation.
 
 ### The state machine
 
-`CorrelationId` is the `OrderId`. One order, one saga row. MassTransit sets `CorrelationId` from `CorrelateById` when the first `OrderPlacedV1` creates the instance.
+Correlation is by order id. State and event properties have distinct names, and capture/failure messages for a missing saga fault rather than disappear. Configure bounded retry/redelivery for an event that races the initial `OrderPlaced`, then alert and replay if the dependency never arrives.
 
 ```C#
-public sealed class OrderSaga : SagaStateMachineInstance, ISaga
+public sealed class OrderSaga : SagaStateMachineInstance
 {
     public Guid CorrelationId { get; set; }
     public string CurrentState { get; set; } = "";
     public Guid? PaymentTimeoutTokenId { get; set; }
+    public DateTimeOffset PaymentDeadline { get; set; }
+    public string? CapturedPaymentId { get; set; }
 }
 
 public sealed class OrderSagaMachine : MassTransitStateMachine<OrderSaga>
 {
     public State AwaitingPayment { get; private set; } = null!;
+    public State ApplyingPayment { get; private set; } = null!;
     public State Paid { get; private set; } = null!;
-    public State PaymentFailed { get; private set; } = null!;
+    public State PaymentStopped { get; private set; } = null!;
 
     public Event<OrderPlacedV1> OrderPlaced { get; private set; } = null!;
+    public Event<OrderPaidV1> OrderPaid { get; private set; } = null!;
+    public Event<PayOrderRejected> PaymentRejected { get; private set; } = null!;
+    public Event<OrderCancelledV1> OrderCancelled { get; private set; } = null!;
     public Event<PaymentCaptured> PaymentCaptured { get; private set; } = null!;
-    public Event<PaymentFailed> PaymentFailed { get; private set; } = null!;
+    public Event<PaymentFailed> PaymentFailure { get; private set; } = null!;
     public Schedule<OrderSaga, PaymentExpired> PaymentTimeout { get; private set; } = null!;
 
-    public OrderSagaMachine()
+    public OrderSagaMachine(TimeProvider time)
     {
-        InstanceState(x => x.CurrentState);
-
-        Event(() => OrderPlaced, x => x.CorrelateById(m => m.Message.OrderId));
-        Event(() => PaymentCaptured, x =>
+        InstanceState(saga => saga.CurrentState);
+        Event(() => OrderPlaced, e => e.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => OrderPaid, e =>
         {
-            x.CorrelateById(m => m.Message.OrderId);
-            x.OnMissingInstance(m => m.Discard());
+            e.CorrelateById(ctx => ctx.Message.OrderId);
+            e.OnMissingInstance(m => m.Fault());
         });
-        Event(() => PaymentFailed, x =>
+        Event(() => PaymentRejected, e =>
         {
-            x.CorrelateById(m => m.Message.OrderId);
-            x.OnMissingInstance(m => m.Discard());
+            e.CorrelateById(ctx => ctx.Message.OrderId);
+            e.OnMissingInstance(m => m.Fault());
         });
-
+        Event(() => OrderCancelled, e =>
+        {
+            e.CorrelateById(ctx => ctx.Message.OrderId);
+            e.OnMissingInstance(m => m.Fault());
+        });
+        Event(() => PaymentCaptured, e =>
+        {
+            e.CorrelateById(ctx => ctx.Message.OrderId);
+            e.OnMissingInstance(m => m.Fault());
+        });
+        Event(() => PaymentFailure, e =>
+        {
+            e.CorrelateById(ctx => ctx.Message.OrderId);
+            e.OnMissingInstance(m => m.Fault());
+        });
         Schedule(() => PaymentTimeout, saga => saga.PaymentTimeoutTokenId, schedule =>
         {
             schedule.Delay = TimeSpan.FromMinutes(15);
-            schedule.Received = received => received.CorrelateById(m => m.Message.OrderId);
+            schedule.Received = e => e.CorrelateById(ctx => ctx.Message.OrderId);
         });
 
-        Initially(
-            When(OrderPlaced)
-                .Publish(ctx => new RequestPayment(
-                    ctx.Message.OrderId,
-                    ctx.Message.Total,
-                    ctx.Message.Currency))
-                .Schedule(PaymentTimeout, ctx => new PaymentExpired(ctx.Message.OrderId))
-                .TransitionTo(AwaitingPayment));
+        Initially(When(OrderPlaced)
+            .Then(ctx => ctx.Saga.PaymentDeadline = ctx.Message.OccurredAt.AddMinutes(15))
+            .IfElse(ctx => ctx.Saga.PaymentDeadline <= time.GetUtcNow(),
+                expired => expired.Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId))
+                    .TransitionTo(PaymentStopped),
+                active => active.Publish(ctx => new RequestPayment(ctx.Message.OrderId, ctx.Message.Total, ctx.Message.Currency))
+                    .Schedule(PaymentTimeout, ctx => new PaymentExpired(ctx.Saga.CorrelationId),
+                        ctx => { var remaining = ctx.Saga.PaymentDeadline - time.GetUtcNow(); return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero; })
+                    .TransitionTo(AwaitingPayment)));
 
         During(AwaitingPayment,
             Ignore(OrderPlaced),
             When(PaymentCaptured)
+                .Then(ctx => ctx.Saga.CapturedPaymentId = ctx.Message.PaymentId)
                 .Unschedule(PaymentTimeout)
-                .Publish(ctx => new PayOrder(ctx.Saga.CorrelationId))
-                .TransitionTo(Paid),
-            When(PaymentFailed)
-                .Unschedule(PaymentTimeout)
-                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId))
-                .TransitionTo(PaymentFailed),
+                .Publish(ctx => new PayOrder(ctx.Saga.CorrelationId, ctx.Message.PaymentId))
+                .TransitionTo(ApplyingPayment),
+            When(PaymentFailure).Unschedule(PaymentTimeout)
+                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId)).TransitionTo(PaymentStopped),
             When(PaymentTimeout.Received)
-                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId))
-                .TransitionTo(PaymentFailed));
+                .Publish(ctx => new FailOrderPayment(ctx.Saga.CorrelationId)).TransitionTo(PaymentStopped),
+            When(OrderCancelled).Unschedule(PaymentTimeout).TransitionTo(PaymentStopped));
+
+        During(ApplyingPayment,
+            Ignore(OrderPlaced), Ignore(PaymentFailure), Ignore(PaymentTimeout.Received),
+            When(OrderPaid).TransitionTo(Paid),
+            When(PaymentRejected).TransitionTo(PaymentStopped),
+            When(PaymentCaptured).If(ctx => ctx.Message.PaymentId != ctx.Saga.CapturedPaymentId,
+                duplicateCharge => duplicateCharge.Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId, ctx.Message.PaymentId))),
+            When(OrderCancelled)
+                .Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId, ctx.Saga.CapturedPaymentId!))
+                .TransitionTo(PaymentStopped));
 
         During(Paid,
-            Ignore(OrderPlaced),
-            Ignore(PaymentCaptured),
-            Ignore(PaymentFailed),
-            Ignore(PaymentTimeout.Received));
+            Ignore(OrderPlaced), Ignore(OrderPaid), Ignore(PaymentFailure), Ignore(PaymentTimeout.Received),
+            When(PaymentCaptured).If(ctx => ctx.Message.PaymentId != ctx.Saga.CapturedPaymentId,
+                duplicateCharge => duplicateCharge.Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId, ctx.Message.PaymentId))),
+            When(OrderCancelled)
+                .Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId, ctx.Saga.CapturedPaymentId!))
+                .TransitionTo(PaymentStopped));
 
-        During(PaymentFailed,
-            Ignore(OrderPlaced),
-            Ignore(PaymentFailed),
-            Ignore(PaymentTimeout.Received),
-            When(PaymentCaptured)
-                .Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId)));
+        During(PaymentStopped,
+            Ignore(OrderPlaced), Ignore(OrderCancelled), Ignore(PaymentRejected), Ignore(PaymentFailure), Ignore(PaymentTimeout.Received),
+            When(PaymentCaptured).Publish(ctx => new RefundRequired(ctx.Saga.CorrelationId, ctx.Message.PaymentId)));
     }
 }
 ```
 
-`OrderPlacedV1` already has `Total` and `Currency`. The saga copies them onto `RequestPayment` and does not read the `orders` table. A capture that arrives after the timeout finds `PaymentFailed` and publishes `RefundRequired`, not `PayOrder`. That is the same incident as [a payment process](#a-payment-process): the money moved, the order did not. Returning the message to the queue will not make `MarkPaid` legal.
+The deadline is measured from the order's business timestamp, not from when a delayed outbox message happens to start the saga. This example lets the persisted process state choose the capture-versus-timeout race. A strict wall-clock payment cutoff needs a separate agreed rule using verified capture time and reconciliation; scheduling alone does not enforce it.
 
-`Ignore(OrderPlaced)` while waiting drops a second event for the same order. The inbox on the publisher already dedupes by `EventId`. The ignore is the backstop. `Ignore(PaymentFailed)` while `Paid` drops a late failure. Handling it would publish `FailOrderPayment` and release stock on an order that already took money. An unhandled event faults the endpoint and retries until the message dead-letters.
-
-The saga row moves to `Paid` when `PayOrder` is published, not when `MarkPaid` commits. `PayOrderConsumer` retries. The handler is idempotent, so a redelivery finishes the order. A dead-letter leaves the saga on `Paid` and the order on `Placed`. That pair is an incident, the same shape as a refund. Do not call `MarkPaid` inside `.Then` to hide it.
-
-Do not `.Finalize()`. Finalize deletes the row, and a late `PaymentCaptured` becomes a missing instance. `OnMissingInstance(Discard)` would then hide the refund. Leave the terminal row.
+Cancellation is part of the process: without `OrderCancelledV1`, a captured payment can be accepted by the saga while the aggregate has already cancelled. A late capture after failure/cancellation publishes compensation. Distinct additional captures are refunded rather than silently discarded as duplicates. A rejection moves `ApplyingPayment` to `PaymentStopped`, while its consumer requests a refund. Production still needs provider receipt verification, reconciliation of stuck `ApplyingPayment`, refund-completion tracking, and operator visibility.
 
 #### ❌ BAD — the state machine is a second aggregate
 
-```C#
-When(PaymentCaptured)
-    .ThenAsync(async ctx =>
-    {
-        var orders = ctx.GetPayload<IOrderRepository>();
-        var order = await orders.GetAsync(new OrderId(ctx.Saga.CorrelationId), ctx.CancellationToken);
-        order!.MarkPaid(DateTimeOffset.UtcNow);
-    })
-```
-
-The transition runs inside the saga consume, with `DateTimeOffset.UtcNow`, and only if the repository was stuffed into the consume context. The handler's idempotency check, the stock release on failure, and the outbox for `OrderPaid` are skipped. Publish `PayOrder`. Let `PayOrderConsumer` call the handler.
+Calling `Order.MarkPaid` directly inside `.Then` mixes the saga transaction with an aggregate use case, bypasses the handler's authorization/idempotency policy, and can omit the aggregate outbox. Publish a command to its owning context, then wait for the committed result.
 
 ### Commit the saga row with the publish
 
-`Initially` inserts the saga row and publishes `RequestPayment`. A direct broker publish can accept the message and then lose the row, or commit the row and never publish. Payment then runs for an order the saga will start again, or the saga waits for a payment it never requested.
-
-MassTransit's Entity Framework outbox writes that publish into its own tables in the same `SaveChanges` as the saga row. A delivery service sends the row after commit. This is the same rule as [the outbox](#write-the-outbox-in-the-same-transaction), implemented by the bus. Package: `MassTransit.EntityFrameworkCore`.
-
-Add the three bus tables and the saga map to the existing `OnModelCreating`, after `HasDefaultSchema("ordering")`, so they land in schema `ordering`:
+Use the EF transactional Consumer Outbox on the saga endpoint so saga state, incoming receipt, and outgoing commands commit together. Register the bus tables separately from the custom checkout `outbox_messages` table:
 
 ```C#
 modelBuilder.AddInboxStateEntity();
 modelBuilder.AddOutboxMessageEntity();
 modelBuilder.AddOutboxStateEntity();
 new OrderSagaMap().Configure(modelBuilder);
-```
 
-`AddInboxStateEntity`, `AddOutboxMessageEntity`, and `AddOutboxStateEntity` are in the `MassTransit` namespace. They create `InboxState`, `OutboxState`, and `OutboxMessage`. Your checkout outbox is the table `outbox_messages`, mapped from your own `OutboxMessage` class. Leave that table alone. MassTransit must not be configured onto it.
-
-One pipe publishes `OrderPlacedV1` through your worker. The saga's `RequestPayment`, `PayOrder`, and `FailOrderPayment` go through the MassTransit outbox. Publishing `OrderPlacedV1` from both pipes delivers it twice. The inbox hides the duplicate and you still did the work twice on the way out.
-
-`UsePostgres()` only installs the `FOR UPDATE` statement. The repository's default concurrency mode is optimistic, and that statement is unused until the mode is pessimistic. Two `PaymentCaptured` deliveries can both read `AwaitingPayment` and the second commit overwrites the first. Optimistic mode needs `ISagaVersion` (`int Version` on the saga). Leaving the default and also skipping the version property means there is no token. The registration below sets `ConcurrencyMode.Pessimistic`. SQL Server is `UseSqlServer()` on that same repository and on the outbox. The saga repository and the outbox must use this `OrderingDbContext`. A second context commits the saga insert and the `RequestPayment` row separately. Do not wrap the two contexts in a `TransactionScope` to fake one commit.
-
-```C#
 public sealed class OrderSagaMap : SagaClassMap<OrderSaga>
 {
     protected override void Configure(EntityTypeBuilder<OrderSaga> entity, ModelBuilder model)
     {
         entity.ToTable("order_saga");
-        entity.Property(x => x.CurrentState).HasMaxLength(64);
+        entity.Property(saga => saga.CurrentState).HasMaxLength(64);
+        entity.Property(saga => saga.CapturedPaymentId).HasMaxLength(200);
     }
 }
 ```
 
-`SagaClassMap` keys the row on `CorrelationId`. A migration that contains `order_saga`, `InboxState`, `OutboxState`, and MassTransit's `OutboxMessage` is the check that the map ran. A missing table faults the first `OrderPlacedV1`.
+The first four lines belong in `OrderingDbContext.OnModelCreating`; the class map is a separate type. `UsePostgres` selects the lock provider; explicitly choose `ConcurrencyMode.Pessimistic` below. Optimistic EF saga persistence needs a correctly mapped token (PostgreSQL `uint RowVersion` mapped to `xmin`, or SQL Server `byte[] RowVersion`), not a guessed `ISagaVersion` interface. See the [EF saga repository](https://masstransit.massient.com/configuration/saga-repositories/entity-framework).
+
+The saga and Consumer Outbox use the same scoped context/transaction. The custom interceptor leaves aggregate events intact while an enclosing transaction is open; its owner clears them after commit or disposes the scope. Do not accidentally share a custom outbox entity/table with MassTransit's `OutboxMessage`.
 
 ### One timeout
 
-`Schedule` writes a delayed `PaymentExpired`. It does nothing until the bus has a scheduler. On RabbitMQ that is the delayed-message plug-in, `AddDelayedMessageScheduler`, and `UseDelayedMessageScheduler`. On Azure Service Bus it is `AddServiceBusMessageScheduler` and `UseServiceBusMessageScheduler`. A raw RabbitMQ bus without the plug-in accepts the state machine and never delivers the timeout. The order stays `AwaitingPayment` and stock stays reserved.
-
-Fifteen minutes is the same product rule as `ExpireUnpaidOrders`. Run one of them. Both will publish a failure, and `MarkPaymentFailed` throws unless the status is `Placed`. The second caller gets a `DomainRuleException` and the message retries until it dead-letters.
-
-RabbitMQ's delayed exchange does not cancel a scheduled message. Azure Service Bus, the SQL transport, and Quartz do. Call `Unschedule` so a transport that can cancel does. Still `Ignore(PaymentTimeout.Received)` in `Paid` and `PaymentFailed`, because on RabbitMQ the timeout arrives anyway. Without that ignore the endpoint faults a message for an order that already finished.
+RabbitMQ scheduling requires its delayed-message plugin plus the scheduler registration. `Unschedule` cannot retract a RabbitMQ delayed-exchange message, so terminal states still ignore a late timeout. Other transports have different cancellation support. Run either this timeout or `ExpireUnpaidOrders` as the process owner, and make failure handling idempotent in either case. See [scheduled events](https://masstransit.massient.com/guides/saga-state-machines/schedule-event).
 
 ### Register the bus
 
-The state machine and the two consumers are in the host or the infrastructure project, not in `Ordering.Domain`. The domain project does not reference MassTransit. `OrderSagaDefinition` is how the saga endpoint gets the transactional outbox without a second receive endpoint. `ConfigureEndpoints` already creates the saga endpoint. Configuring the saga again by hand makes two competing consumers.
-
 ```C#
+public sealed class PayOrderConsumerDefinition : ConsumerDefinition<PayOrderConsumer>
+{
+    protected override void ConfigureConsumer(IReceiveEndpointConfigurator endpoint,
+        IConsumerConfigurator<PayOrderConsumer> consumer, IRegistrationContext context)
+    {
+        endpoint.UseEntityFrameworkOutbox<OrderingDbContext>(context);
+    }
+}
+
 public sealed class OrderSagaDefinition : SagaDefinition<OrderSaga>
 {
-    protected override void ConfigureSaga(
-        IReceiveEndpointConfigurator endpoint,
-        ISagaConfigurator<OrderSaga> saga,
-        IRegistrationContext context)
+    protected override void ConfigureSaga(IReceiveEndpointConfigurator endpoint,
+        ISagaConfigurator<OrderSaga> saga, IRegistrationContext context)
     {
         endpoint.UseEntityFrameworkOutbox<OrderingDbContext>(context);
     }
@@ -3290,36 +3475,30 @@ services.AddMassTransit(bus =>
             repository.UsePostgres();
             repository.ConcurrencyMode = ConcurrencyMode.Pessimistic;
         });
-
-    bus.AddConsumer<PayOrderConsumer>();
+    bus.AddConsumer<PayOrderConsumer, PayOrderConsumerDefinition>();
     bus.AddConsumer<FailOrderPaymentConsumer>();
-
-    bus.AddEntityFrameworkOutbox<OrderingDbContext>(outbox =>
+    bus.AddEntityFrameworkOutbox<OrderingDbContext>(outbox => outbox.UsePostgres());
+    bus.AddConfigureEndpointsCallback((context, name, endpoint) =>
     {
-        outbox.UsePostgres();
-        outbox.UseBusOutbox();
+        endpoint.UseDelayedRedelivery(r => r.Intervals(TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
+        endpoint.UseMessageRetry(r => r.Intervals(TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(1)));
     });
-
-    bus.AddConfigureEndpointsCallback((context, name, cfg) =>
-    {
-        cfg.UseMessageRetry(retry => retry.Intervals(
-            TimeSpan.FromMilliseconds(200),
-            TimeSpan.FromSeconds(1),
-            TimeSpan.FromSeconds(5)));
-    });
-
     bus.AddDelayedMessageScheduler();
-
     bus.UsingRabbitMq((context, cfg) =>
     {
         cfg.Host(configuration["RabbitMq:Host"] ?? "localhost");
         cfg.UseDelayedMessageScheduler();
+        cfg.Message<OrderPlacedV1>(message => message.SetEntityName("ordering.order_placed.v1"));
+        cfg.Message<OrderPaidV1>(message => message.SetEntityName("ordering.order_paid.v1"));
+        cfg.Message<OrderCancelledV1>(message => message.SetEntityName("ordering.order_cancelled.v1"));
         cfg.ConfigureEndpoints(context);
     });
 });
 ```
 
-`PayOrderConsumer` and `FailOrderPaymentConsumer` do not need `UseEntityFrameworkOutbox`. The handlers write `OrderPaid` and `OrderPaymentFailed` through your interceptor into `outbox_messages`. A second outbox on that consumer would be for bus publishes the handler does not make. Retry lives on the endpoint callback once. Adding `UseMessageRetry` again inside `OrderSagaDefinition` stacks a second retry policy on the saga.
+This registration enables the saga Consumer Outbox, not a Bus Outbox for every application publish. Enable `UseBusOutbox` separately only if publishers outside consumers need it, and ensure the custom dispatcher bypasses it as described above. The custom dispatcher must publish typed contracts using the same topology/serialization and stable `MessageId`. A raw JSON publish to an arbitrary exchange does not automatically become a MassTransit contract.
+
+`PayOrderConsumer` uses the Consumer Outbox for its rejection/refund responses as well as its incoming receipt. Its successful handler writes `OrderPaidV1` through the custom interceptor in that transaction. `FailOrderPaymentConsumer` uses terminal-state checks and the custom outbox and emits no direct bus response. Configure retry once at the endpoint and let `ConfigureEndpoints` create the saga endpoint once. Supply broker credentials, the required plugin, schema migrations, and the chosen MassTransit version's license configuration. Check [transactional outbox configuration](https://masstransit.massient.com/configuration/middleware/outbox).
 
 ## Testing
 
@@ -3369,13 +3548,14 @@ public sealed class OrderTests
             ShipTo,
             [line, line],
             "key-1",
+            "test-request-hash",
             Now));
 
         Assert.Contains("one line", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void Total_rounds_each_line_before_adding()
+    public void Total_sums_fixed_precision_line_values()
     {
         var order = Order.Place(
             OrderId.New(),
@@ -3386,6 +3566,7 @@ public sealed class OrderTests
                 new OrderLine(new ProductId(Guid.CreateVersion7()), "B", 1, new Money(0.20m, "USD"))
             ],
             "key-2",
+            "test-request-hash",
             Now);
 
         Assert.Equal(new Money(0.40m, "USD"), order.Total);
@@ -3397,6 +3578,7 @@ public sealed class OrderTests
         ShipTo,
         [new OrderLine(new ProductId(Guid.CreateVersion7()), "Tea", 2, new Money(10, "USD"))],
         "key",
+        "test-request-hash",
         Now);
 }
 ```
@@ -3456,7 +3638,7 @@ public sealed class PlaceOrderHandlerTests
             new Address("1 Main", "Hanoi", "10000", "VN"),
             [new PlaceOrderLine(productId, 2)],
             "idem-1",
-            new Actor(new UserId(Guid.CreateVersion7()), ActorRole.Buyer, null)), default);
+            new Actor(new UserId(Guid.CreateVersion7()), ActorRole.Staff, null)), default);
 
         var order = orders.Store[id];
         Assert.Equal(new Money(12, "USD"), order.Lines.Single().UnitPrice);
@@ -3468,9 +3650,31 @@ public sealed class PlaceOrderHandlerTests
 
 The fakes are trivial and live in the test project. A fake that is a second business implementation ("in-memory EF") will drift. Prefer a dictionary.
 
-One integration test, not fifty, hits PostgreSQL: map an order, commit, reload, assert lines and that `Place` was not run again (event list empty on reload). That test catches a backing-field mistake the fakes cannot catch. Use the same `OrderingDbContext` and configuration as production. Testcontainers or a local database is an infrastructure concern. Keep it out of the domain test project so `dotnet test` on the domain project stays hermetic.
+Integration tests against PostgreSQL cover behavior the fakes cannot verify. Start with persistence round-trip: map an order, commit, reload, assert lines and that `Place` was not run again (event list empty on reload). That test catches a backing-field mistake the fakes cannot catch. Use the same `OrderingDbContext` and configuration as production. Testcontainers or a local database is an infrastructure concern. Keep it out of the domain test project so `dotnet test` on the domain project stays hermetic.
 
 Assert the handler does not commit when `Reserve` throws. A fake stock that throws on the second line, and a `Commits` count of 0, locks the "one transaction" rule.
+
+### Integration and failure tests
+
+Use the actual relational provider for the promises that depend on SQL. EF InMemory and dictionary fakes cannot verify transactions, constraints, translation, or concurrency.
+
+| Scenario | Assertion |
+|----------|-----------|
+| Persist/reload an order with complex values and child lines | Values survive; load raises no domain event |
+| Two placements use the same scoped key | One order, one net reservation, one placement outbox row; retries return the winner |
+| Same key, different body; unauthorized replay | 409 for mismatch; ownership rejection before receipt lookup |
+| Two scopes reserve the last unit | One commit succeeds; the failed order/reserve/outbox all roll back |
+| A save fails after staging events | No committed outbox row for the failed transition; the scope ends |
+| An explicit transaction rolls back after a successful save | No external publish; do not reuse accepted tracking state |
+| Worker crashes after broker acceptance | Redelivery has the same event/message id; consumer local writes are deduplicated |
+| Lease A expires, B reclaims, A completes | A's token-guarded update affects zero rows and does not clear B's lease |
+| Cancel arrives before invoice creation; capture arrives after expiry | Durable retry/pending transition; one idempotent refund workflow |
+| Saga publishes a pay command but receives no committed result | It remains observable in `ApplyingPayment`, with recovery after retry exhaustion |
+| Keyset cursor has tied timestamps | No skipped/duplicate row caused by a missing id tie-breaker; SQL uses the expected provider ordering |
+
+Test currency rounding explicitly (for example, USD 1.005 → 1.00 and 1.015 → 1.02 with `ToEven`) and reject `default(Money)`, `default(Address)`, empty ids, and mixed currencies. Fakes prove orchestration, not rollback; a zero commit count does not reset their in-memory mutations.
+
+Rebuilding event-sourced aggregates should be tested against representative old payloads, deterministic `Apply`, snapshots, expected-version conflicts, and projection checkpoint replay.
 
 ### Architecture test
 
@@ -3493,7 +3697,7 @@ public void Handlers_do_not_take_dbcontext_in_their_constructors()
 }
 ```
 
-This fails closed when someone adds `OrderingDbContext` to `CancelOrderHandler` to "just this once" run a query. It is a string check on the type name. It is enough.
+This catches constructors whose parameter name contains `DbContext`, but misses differently named persistence services and dependencies inside method bodies. Treat it as a simple smoke check, not a complete architecture proof. Combine project-reference checks with type/namespace dependency tests when enforcing a strict boundary.
 
 ## Tenancy and time
 
@@ -3506,9 +3710,15 @@ builder.Property<Guid>("TenantId");
 builder.HasIndex("TenantId", nameof(Order.Id));
 ```
 
-If every row is tenant-scoped, put `TenantId` on the aggregate as a real property set in `Place` from the command, and filter in the `DbContext` as shown earlier. A shadow property plus a filter works until a raw SQL report forgets the predicate. A column the domain knows about is harder to forget in a factory and easier to forget in SQL. The unique index for idempotency becomes `(tenant_id, idempotency_key)`. A key that is unique globally will collide when two tenants reuse a client-generated UUID. Scope the uniqueness to the tenant.
+If every row is tenant-scoped, put `TenantId` on the aggregate as a real property set in `Place` from the command, and filter in the `DbContext` as shown earlier. A shadow property plus a filter works until a raw SQL report forgets the predicate. A column the domain knows about is harder to forget in a factory and easier to forget in SQL. The unique index and lookup for this sample become `(tenant_id, customer_id, idempotency_key)`; a separate receipts table also includes the operation name. A key that is unique globally will collide when two tenants reuse a client-generated UUID. Scope the uniqueness to the tenant.
 
 The domain rule is not "tenants exist". The domain rule is "this order belongs to the tenant that placed it and does not move". There is no `ChangeTenant` method.
+
+### Tenant isolation also applies to writes and messages
+
+Global query filters help reads; they do not authorize detached writes, raw SQL, or every keyless view. Set tenant ownership from a verified host/consumer context, reject missing tenant scope, and enforce inserts/updates in persistence. Carry `TenantId` in outbox/inbox envelopes and scope idempotency by tenant, customer, and operation.
+
+Use tenant-aware unique/FK keys where relationships must remain inside a tenant. An index on `(TenantId, Id)` alone neither assigns the tenant nor prevents a child from referencing another tenant's root. Background workers must deliberately bind the tenant for each unit of work or use a tightly scoped system adapter. A pooled context must reset per-request tenant state correctly; never let a captured first tenant become the shared model's scope. Define and test privileged cross-tenant access separately.
 
 ### Time and ids are inputs
 
@@ -3527,9 +3737,9 @@ One clock read per use case (`var now = time.GetUtcNow()`), then pass `now` into
 
 ## Modular monolith
 
-A modular monolith is one deployable process and one database server, with a separate model per bounded context. Ordering and Billing ship in the same executable and can use the same PostgreSQL instance. They do not share an `Order` class, a `DbContext`, or a migration history.
+A modular monolith is one deployable application, with a separate model per bounded context. Ordering and Billing ship in the same executable and can use the same PostgreSQL instance. They do not share an `Order` class, a `DbContext`, or a migration history.
 
-It is the step before microservices. You get a boundary the compiler can see, without a network hop between place-order and create-invoice. Split a module into its own service later, when a real constraint shows up (scale, a team that must deploy alone, a datastore that cannot live in this instance). Splitting on day one because a diagram has boxes means you operate a distributed system whose modules still share types through a "common" project.
+It can be the long-term architecture, or a starting point for a later service split. You get a boundary the compiler can see, without a network hop between place-order and create-invoice. Split a module into its own service later, when a real constraint shows up (scale, a team that must deploy alone, a datastore that cannot live in this instance). Splitting on day one because a diagram has boxes means you operate a distributed system whose modules still share types through a "common" project.
 
 | | One codebase, one model | Modular monolith | Microservices |
 |--|-------------------------|------------------|---------------|
@@ -3563,7 +3773,7 @@ src/
 
 `Host` references `Ordering` and `Billing`. `Billing` references `Ordering.Contracts`. `Billing` does not reference `Ordering`. That missing reference is the boundary. A folder named `Modules/Billing` inside one project does not stop `using Ordering.Domain`.
 
-Four projects per module (Domain, Application, Infrastructure, Api) times five modules is twenty projects before a feature exists. One assembly per module plus a thin Contracts assembly is the same [dependency rule](#the-dependency-rule), with `internal` on the aggregate instead of a separate csproj. Split the module into Domain and Infrastructure when people keep calling EF from a feature folder and review is not catching it. The host stays the only composition root.
+Four projects per module (Domain, Application, Infrastructure, Api) times five modules is twenty projects before a feature exists. One assembly per module plus a thin Contracts assembly enforces the boundary between modules with `internal`. It does not enforce the internal layer dependency rule: a domain type in that assembly can still reference EF. Enforce that with type-level tests/review or separate layer projects. Split the module into Domain and Infrastructure when people keep calling EF from a feature folder and review is not catching it. The host stays the only composition root.
 
 ### What a module owns
 
@@ -3656,17 +3866,9 @@ public static class OrderingModule
 {
     public static IServiceCollection AddOrdering(this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("Ordering")
-            ?? throw new InvalidOperationException("Connection string 'Ordering' is missing.");
-
-        services.AddDbContext<OrderingDbContext>(options =>
-            options.UseNpgsql(connectionString, npgsql =>
-                npgsql.MigrationsHistoryTable("__ef_migrations", "ordering")));
-
-        services.AddScoped<IOrderRepository, EfOrderRepository>();
+        services.AddOrderingApplication();
+        services.AddOrderingInfrastructure(configuration); // includes ports and outbox interceptor
         services.AddScoped<IOrderTotals, EfOrderTotals>();
-        services.AddScoped<PlaceOrderHandler>();
-        services.AddScoped<CancelOrderHandler>();
         return services;
     }
 
@@ -3691,7 +3893,7 @@ app.MapBilling();
 app.Run();
 ```
 
-`AddOrdering` is idempotent: a second call must not register a second `DbContext` pool by accident. Use `TryAdd` for services a module might share (`TimeProvider`). Do not `BuildServiceProvider()` inside `AddOrdering`.
+Call `AddOrdering` once per module during startup. The ordinary `AddScoped` registrations shown are not all idempotent and can produce duplicates in `IEnumerable<T>` if repeated. If repeatable registration is a requirement, guard the entire module registration with a marker. Use `TryAdd` for services a module might share (`TimeProvider`). Do not `BuildServiceProvider()` inside `AddOrdering`.
 
 One connection string can point both modules at the same instance. The schemas differ (`ordering`, `billing`). Two connection strings are how you later move Billing to another instance without editing handlers.
 
@@ -3764,7 +3966,13 @@ public sealed class ModuleLoadContext : AssemblyLoadContext
         var shared = Default.Assemblies.FirstOrDefault(loaded =>
             string.Equals(loaded.GetName().Name, assemblyName.Name, StringComparison.OrdinalIgnoreCase));
         if (shared is not null)
+        {
+            if (assemblyName.Version is { } requested && shared.GetName().Version is { } loaded && loaded < requested)
+                throw new InvalidOperationException($"Shared assembly {assemblyName.Name} is older than {requested}.");
             return shared;
+        }
+        if (assemblyName.Name?.EndsWith(".Contracts", StringComparison.Ordinal) == true)
+            return Default.LoadFromAssemblyName(assemblyName); // host-deployed contract dependency
 
         var path = _resolver.ResolveAssemblyToPath(assemblyName);
         return path is null ? null : LoadFromAssemblyPath(path);
@@ -3778,7 +3986,7 @@ public sealed class ModuleLoadContext : AssemblyLoadContext
 }
 ```
 
-Returning the default-context assembly for `Modules.Abstractions`, ASP.NET Core, and EF keeps one type identity. A second load of `IModule` from the module folder makes the cast fail at runtime with no compile error.
+Returning the default-context assembly for `Modules.Abstractions` and shared framework types keeps one type identity. Deploy contract assemblies as host dependencies (the host may reference Contracts while avoiding module implementations); the loader resolves `*.Contracts` in the default context so Ordering and Billing see the same contract/interface identity. A private copy loaded separately per module can otherwise make a DI service registration impossible to resolve. This simple loader shares already-loaded packages too: it is not a dependency-isolation boundary. Coordinate shared versions, or use an explicit shared-assembly allowlist and module-private dependency policy for plugins with conflicting SDKs.
 
 ```C#
 public static class ModuleLoader
@@ -3850,7 +4058,7 @@ foreach (var module in app.Services.GetRequiredService<IReadOnlyList<IModule>>()
 app.Run();
 ```
 
-`dotnet ef migrations add` still needs a startup project that references the module. The web host's dynamic load does not put Ordering on the compiler's reference list, so the EF tool cannot see `OrderingDbContext` from `Host` alone. Run migrations from the module project, or from a small migrator project that has the `ProjectReference`.
+For tooling, target the module's persistence project and use an `IDesignTimeDbContextFactory<OrderingDbContext>` or a small migrator host with explicit references. A dynamically loaded module can be discovered at runtime, but its web host may not reproduce that setup under EF tools. A design-time factory avoids relying on that loader for migrations.
 
 #### ❌ BAD — a plugin folder you hot-swap
 
@@ -4088,7 +4296,7 @@ If `CommitAsync` throws a unique violation, the transaction rolls back the same 
 
 If `CommitAsync` succeeds and the process dies before the HTTP response is flushed, the client retries. The lookup returns the same id. The outbox row is still unpublished and the worker sends it once (plus at-least-once retries the inbox collapses).
 
-If the catalog port throws, stock is not reserved, because `Reserve` is after the price loop and `Commit` has not run. Do not reorder this so that `Reserve` happens before you know the product exists. You would release in a `catch`, and a crash between reserve and release leaks a hold. The order of calls in the handler is part of the design.
+If the catalog port throws, no changes have committed. Keeping catalog I/O before stock changes avoids unnecessary tracked mutations and keeps any explicit transaction short. In-memory `Reserve` before a failed price lookup also needs no database compensation if the scope is discarded without saving; a hold leaks only if you commit it separately. The order of calls in the handler is part of the design.
 
 ```C#
 // prices first (no writes), then one graph of tracked changes, then one commit
@@ -4099,7 +4307,7 @@ foreach (var requested in command.Lines)
 }
 var order = Order.Place(...);
 await orders.AddAsync(order, cancellationToken);
-foreach (var line in order.Lines)
+foreach (var line in order.Lines.OrderBy(line => line.ProductId.Value))
     (await stockItems.GetAsync(line.ProductId, cancellationToken))!.Reserve(...);
 await unitOfWork.CommitAsync(cancellationToken);
 ```
@@ -4144,7 +4352,7 @@ public sealed class ShipOrderHandler(
         var now = time.GetUtcNow();
         order.Ship(now);
 
-        foreach (var line in order.Lines)
+        foreach (var line in order.Lines.OrderBy(line => line.ProductId.Value))
         {
             var stock = await stockItems.GetAsync(line.ProductId, cancellationToken)
                 ?? throw new DomainRuleException($"No stock row for {line.ProductId}.");
@@ -4171,18 +4379,18 @@ These are the EF mistakes that produce a green domain test and a broken reload.
 | `OrderPlaced` inserted again on every cancel | `Raise` lives in a property setter or in a constructor EF calls | `Raise` only inside `Place`, `Cancel`, `Ship`, … Private empty constructor for EF |
 | Lines empty after `GetAsync` | Collection not included, or EF wrote a shadow collection because it could not see `_lines` | `Include`, and `UsePropertyAccessMode(Field)` |
 | Insert fails, `null` product name | Public constructor never ran; a mapper set properties EF then saved | Application code calls `new OrderLine(...)`. No public setters for the mapper |
-| Two lines, one product, both saved | Composite key `(OrderId, ProductId)` missing, EF used a surrogate | `line.HasKey("OrderId", nameof(OrderLine.ProductId))` plus the domain check |
-| Money stored as one string column you cannot sum | No `ComplexProperty` / owned columns | Amount `numeric(18,2)`, currency `char(3)` |
+| Two lines, one product, both saved | Composite key `(OrderId, ProductId)` missing, EF used a surrogate | Child key `(OrderId, ProductId)` plus the domain check |
+| Money stored as one string column you cannot sum | No `ComplexProperty` / separate columns | Amount `numeric(18,2)`, currency `varchar(3)` |
 | Second cancel wins silently | No concurrency token | `xmin` or `rowversion`, map `DbUpdateConcurrencyException` to 409 |
 | Idempotency key allows two rows | Unique index not created, or filter excludes the rows you insert | Migration contains the unique index; a test inserts twice |
-| Query filter hides a row the unique index still sees | Soft-delete filter without a matching unique index predicate | Cancel is a status, or the index has the same `WHERE` |
+| Query filter hides a row the unique index still sees | Idempotency lookup shares the soft-delete filter | Use a durable receipt lookup, or keep orders visible by terminal status |
 
-Configure the model in `IEntityTypeConfiguration<T>`. A data annotation on the entity (`[Required]`, `[Table]`) is an EF reference in the domain project, which fails the dependency test the day you add the package, or it is a stringly convention nobody runs. Keep attributes out of `Ordering.Domain`.
+Configure the model in `IEntityTypeConfiguration<T>`. `[Table]` and `[Required]` are DataAnnotations attributes and do not themselves require an EF Core package. They still attach persistence/validation metadata to the model, so this guide uses fluent EF mapping instead. EF-specific attributes such as `[Owned]` do require EF. Keep attributes out of `Ordering.Domain`.
 
 Migrations:
 
 ```bash
-dotnet ef migrations add PlaceOrder --project Ordering.Infrastructure --startup-project Ordering.Api --output-dir Persistence/Migrations
+dotnet ef migrations add PlaceOrder --project src/Ordering.Infrastructure --startup-project src/Ordering.Api --output-dir Persistence/Migrations
 ```
 
 The startup project is the host because it has the connection string and `AddOrderingInfrastructure`. Review the generated `Up` method. EF will try to create a table for `DomainEvents` if you forgot `Ignore`. It will create a `Total` column if you forgot `Ignore` on the calculated property. Throw that migration away, fix the configuration, add it again. Hand-editing a migration you do not understand is how `xmin` gets created as a real `bigint` the application then fights over.
@@ -4224,6 +4432,9 @@ The stock race is the one that loses money if you skip the token:
 An EF update without a token writes the **values** it loaded: B's entity has `Reserved == 1` and overwrites A's `Reserved == 1` with `1`. You sold two units and reserved one. `ExecuteUpdate` with `SET reserved = reserved + quantity` and a `WHERE on_hand - reserved >= quantity` is the SQL form of the same rule. The aggregate plus a concurrency token is the form that keeps the rule in `Reserve`. Use the SQL predicate in the repository only when the hot row's retry rate is too high for optimistic conflicts, and keep the `WHERE` so a lost precondition cannot update.
 
 ```C#
+if (quantity <= 0)
+    throw new DomainRuleException("Quantity must be positive.");
+
 var updated = await db.Stock
     .Where(s => s.ProductId == productId && s.OnHand - s.Reserved >= quantity)
     .ExecuteUpdateAsync(setters => setters
@@ -4233,17 +4444,19 @@ if (updated == 0)
     throw new DomainRuleException("Not enough stock.");
 ```
 
-That statement is infrastructure. It bypasses `Stock.Reserve` and the domain event. If you take this path for the hot SKU, the repository method is `TryReserve` on the port and it returns whether the update hit, and the handler raises or the SQL is paired with an outbox insert in the same transaction. Do not leave a second writer that "also updates stock" through `ExecuteUpdate` while `ShipOrderHandler` uses the aggregate. One writer per column.
+That statement is infrastructure. `ExecuteUpdate` executes immediately, bypassing change tracking, automatic concurrency-token checks, `SaveChanges` interception, `Stock.Reserve`, and its domain event. The predicate is the concurrency guard. To combine it with an order/outbox write, use one explicit transaction; a later implicit `SaveChanges` transaction does not include a previously executed statement. Do not retain a stale tracked `Stock` that later overwrites this update. If you take this path for the hot SKU, the repository method is `TryReserve` on the port and it returns whether the update hit, and the handler raises or the SQL is paired with an outbox insert in the same transaction. Do not leave a second writer that "also updates stock" through `ExecuteUpdate` while `ShipOrderHandler` uses the aggregate. One writer per column.
+
+See [EF Core ExecuteUpdate](https://learn.microsoft.com/en-us/ef/core/saving/execute-insert-update-delete) for transaction and concurrency limitations. Multiple write paths are possible when they share an explicit concurrency/transaction protocol; the problem is an uncoordinated path that skips those guarantees.
 
 ## What to skip
 
 - **Generic `IRepository<T>` returning `IQueryable<T>`.** Each root has its own load rules. The queryable port is EF in the application layer.
-- **A `Domain` project of POCOs with public setters.** The rules are still in the controller. The folders are a rename.
+- **Public setters on aggregates that need guarded transitions.** A simple CRUD model may remain a data model; the rich checkout model must route changes through its behavior.
 - **One `DbContext` shared by ordering and billing.** One migration history, one word `Order` meaning two things, and a navigation the teams will use because it is there.
 - **Four class libraries on the first CRUD screen.** Split when a second adapter or a real invariant shows up. Keep the dependency direction in folders until then.
 - **A mediator as the architecture.** It hides the handler's constructor. Add a decorator when every use case shares a real pipeline.
 - **`DbContext` or `IEmailSender` injected into `Order`.** The handler loads, the entity decides, the unit of work saves, the consumer sends mail after commit.
-- **Domain events dispatched before commit.** In-process handlers that send mail or call HTTP will do that work for a row that rolls back.
+- **External effects from domain-event handlers before commit.** Local handlers may participate in the transaction; mail, HTTP, and broker publishing need an outbox or another durable after-commit mechanism.
 - **Publishing the CLR type name on the bus.** Renames become breaking changes. Store `ordering.order_placed.v1`.
 - **Event sourcing every table because an outbox already exists.** The outbox is a copy. The `orders` row stays the record until you stop writing it and fold a stream. See [Event sourcing](#event-sourcing).
 - **A MassTransit saga that calls `Order.MarkPaid`.** The saga publishes `PayOrder`. The handler loads the aggregate. A saga and `ExpireUnpaidOrders` must not both expire the same order. See [Saga with MassTransit](#saga-with-masstransit).
@@ -4266,7 +4479,7 @@ That statement is infrastructure. It bypasses `Stock.Reserve` and the domain eve
 
 Before you add a project, a port, or an event, answer these:
 
-1. What sentence does the business use, and is that the method name?
+1. What sentence does the business use, and is that the method name? Which subdomain deserves a rich model?
 2. What must stay true after a crash at any line of the handler? That sentence is the transaction boundary.
 3. Is this rule about one aggregate's fields (method), about two rows in this database (unique index or one commit), or about another service (outbox and a process)?
 4. Can a second caller skip the rule by setting a property? If yes, the setter is public and the design is still anemic.
@@ -4275,9 +4488,21 @@ Before you add a project, a port, or an event, answer these:
 7. What happens when the client retries? Idempotency key on place. Inbox on consume.
 8. What is the HTTP contract? A response DTO and problem details, not the aggregate and not `exception.ToString()`.
 9. Which project would fail to compile if someone used EF in the domain? If the answer is "none", the dependency rule is a comment.
-10. Does the list screen load the aggregate? It should not.
+10. Does the list need behavior or only a projection? Verify its SQL, authorization, cursor ordering, and price/rounding consistency.
 11. If a second driver showed up tomorrow (a queue, a test, a CLI), could it call the same handler? If the handler's constructor names `DbContext` or a vendor SDK, that driver will drag the technology with it.
-12. Which module owns this table? If Billing's csproj references Ordering's assembly to read `Order`, the modular boundary is already gone. Billing gets a contract or an event.
+12. Can a retry or lease expiry repeat an external effect? Check named constraints, fresh scopes, message ids, inbox retention, and provider idempotency.
+13. Which module owns this table? If Billing's csproj references Ordering's assembly to read `Order`, the modular boundary is already gone. Billing gets a contract or an event.
+
+## Primary references
+
+- [Eric Evans: DDD reference](https://www.domainlanguage.com/wp-content/uploads/2016/05/DDD_Reference_2015-03.pdf) — strategic patterns, aggregates, services, and model boundaries.
+- [Alistair Cockburn: Hexagonal architecture](https://alistair.cockburn.us/hexagonal-architecture) and [Robert C. Martin: The Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html) — ports/adapters and source dependency direction.
+- [EF Core complex types](https://learn.microsoft.com/en-us/ef/core/what-is-new/ef-core-10.0/whatsnew), [value conversions](https://learn.microsoft.com/en-us/ef/core/modeling/value-conversions), and [global query filters](https://learn.microsoft.com/en-us/ef/core/querying/filters) — mapping and query limitations.
+- [EF Core transactions](https://learn.microsoft.com/en-us/ef/core/saving/transactions), [concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency), and [connection resiliency](https://learn.microsoft.com/en-us/ef/core/miscellaneous/connection-resiliency) — atomicity and retry scope.
+- [Npgsql concurrency tokens](https://www.npgsql.org/efcore/modeling/concurrency.html) and [translations](https://www.npgsql.org/efcore/mapping/translations.html) — PostgreSQL `xmin` and tuple comparisons.
+- [MassTransit EF saga persistence](https://masstransit.massient.com/configuration/saga-repositories/entity-framework), [outbox](https://masstransit.massient.com/configuration/middleware/outbox), and [scheduled events](https://masstransit.massient.com/guides/saga-state-machines/schedule-event) — provider/version-specific configuration.
+
+The concrete transaction, key, and process choices in this guide are design choices for this checkout. They are not universal requirements of DDD or Clean Architecture.
 
 ## Related guides
 
