@@ -397,9 +397,11 @@ Do not put a mutable `List<T>` inside a value object and still call it a value. 
 
 An immutable `record class` for `Money` also works; be careful that public `init` properties and `with` copies can bypass constructor-only validation. It allocates. For money created in a loop over lines, the struct is the calmer default. Be consistent inside one context so EF configuration does not mix converter styles at random.
 
+**Materialization caveat for `ComplexProperty` structs:** `Money` and `Address` above have getter-only properties and validating constructors, so EF Core invokes those constructors when loading rows from the database. That is fine while the rules (`USD`/`EUR`, field lengths) stay backward-compatible, but if a future change drops a previously stored currency or tightens a rule, loading historical orders will throw during materialization. When value-object rules are likely to evolve, keep a factory method (`Money.Create(...)`) for new writes and let EF materialize via private setters or backing fields without re-running evolving business checks.
+
 ### Entities and identity
 
-An entity is defined by its id. Two orders with the same lines and different ids are different orders. Identity is scoped to the entity type/context (and tenant where applicable); C# class equality remains reference equality unless you implement identity-based equality. Do not use record value equality over all mutable entity fields as a substitute. `OrderId` and `CustomerId` are different types so `GetAsync(customerId)` does not compile.
+An entity is defined by its id. Two orders with the same lines and different ids are different orders. Identity is scoped to the entity type/context (and tenant where applicable); C# class equality remains reference equality unless you implement identity-based equality. Do not use record value equality over all mutable entity fields as a substitute. If you override `Equals` and `GetHashCode` by `Id`, never treat two transient entities with `Id == default` as equal, and never let `GetHashCode` change after the entity enters a `HashSet` or `Dictionary`—another practical reason to assign `OrderId.New()` before saving rather than waiting for a database-generated integer. `OrderId` and `CustomerId` are different types so `GetAsync(customerId)` does not compile.
 
 ```C#
 public readonly record struct OrderId(Guid Value)
@@ -865,6 +867,13 @@ public void Cancel(DateTimeOffset now, IEmailSender email)
 
 Collect the event. Commit the order and the outbox row together. Send mail only from a consumer that read a committed message.
 
+**Pre-commit (in-process) versus post-commit (outbox) dispatch:**
+
+| Dispatch timing | Good for | Avoid for | Main hazard |
+|-----------------|----------|-----------|-------------|
+| Pre-commit (in-process, same transaction) | Updating another aggregate or synchronous read projection in the **same** bounded context and database | Emails, HTTP calls, publishing to a broker, crossing bounded contexts | Calling `SaveChanges` recursively inside an interceptor, or unclear ordering when handlers raise further events |
+| Post-commit (outbox + worker) | Integration events, notifications, cross-module or cross-service work, external side effects | Invariants that must hold atomically on the same commit | Eventual consistency lag and at-least-once delivery (handled via inbox/idempotency) |
+
 ## Where a rule lives
 
 | Rule | Owner | Example |
@@ -935,6 +944,7 @@ Infrastructure must inspect the **constraint name as well as the provider's erro
 `Order.Cancel` answers "is this order in a state that can be cancelled?". It does not answer "is this user allowed to cancel it?". Technical roles and authentication are application concerns. A business permission such as "a payment needs approval by someone other than its author" is a domain rule; model it with business identities and policy inputs rather than framework claims. Staff can cancel a customer's placed order. The customer can cancel their own. A warehouse user cannot.
 
 ```C#
+// Focused on authorization; stock release is added in "Two aggregates in one context" below.
 public sealed class CancelOrderHandler(
     IOrderRepository orders,
     IUnitOfWork unitOfWork,
@@ -952,6 +962,7 @@ public sealed class CancelOrderHandler(
             throw new ForbiddenException();
 
         order.Cancel(time.GetUtcNow());
+        // Full version also releases reserved stock before CommitAsync; see "Two aggregates in one context".
         await unitOfWork.CommitAsync(cancellationToken);
     }
 }
@@ -1560,6 +1571,8 @@ public static class PlaceOrderRules
             throw new DomainRuleException($"An order has 1 to {MaxLines} lines.");
         if (command.Lines.Any(line => line is null || line.ProductId.Value == Guid.Empty || line.Quantity <= 0))
             throw new DomainRuleException("Every line needs a product and positive quantity.");
+        if (command.Lines.Select(line => line.ProductId).Distinct().Count() != command.Lines.Count)
+            throw new DomainRuleException("A product appears on at most one line.");
         command.ShipTo.EnsureValid();
     }
 
@@ -1854,6 +1867,8 @@ public static class OrderingInfrastructure
 
 Register `OutboxInterceptor` as scoped and resolve it from the `AddDbContext` lambda. A singleton interceptor must not capture a scoped `DbContext`. This one does not capture one; it receives the context in `SavingChangesAsync`. Scoped is still the safer lifetime.
 
+**Be careful with `AddDbContextPool`:** a pooled `DbContext` instance is reused across requests and cannot inject scoped dependencies (such as a per-request `ITenantContext` or a scoped interceptor) through its constructor. If you enable pooling on a multi-tenant context without explicitly resetting tenant state per lease (or using a scoped factory that initializes it), one request's tenant can leak into the next. Prefer standard `AddDbContext` unless benchmarks prove context allocation is a real bottleneck.
+
 ### Mapping
 
 ```C#
@@ -1886,6 +1901,12 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
             .HasFilter("idempotency_key IS NOT NULL");
 
         builder.Property(o => o.PlacedAt).HasColumnName("placed_at");
+        builder.HasIndex(o => new { o.CustomerId, o.PlacedAt, o.Id })
+            .HasDatabaseName("ix_orders_customer_placed_id")
+            .IsDescending(false, true, true);
+        builder.HasIndex(o => o.PlacedAt)
+            .HasDatabaseName("ix_orders_placed_expiry")
+            .HasFilter("status = 'Placed'");
         builder.Ignore(o => o.DomainEvents);
         builder.Ignore(o => o.Total);
         builder.Ignore(o => o.Currency);
@@ -1947,7 +1968,7 @@ public sealed class OrderLineConfiguration : IEntityTypeConfiguration<OrderLine>
 
 `ComplexProperty` for `Address` stores columns on `orders`; `OwnsOne` requires a reference type. Lines are regular EF child entities in `order_lines`, keyed by `(OrderId, ProductId)` and loaded through the root repository. Being an EF entity does not make a child a DDD aggregate root. Configuring `Money` through `EntityTypeBuilder<OrderLine>.ComplexProperty` avoids assuming that `OwnedNavigationBuilder` exposes that API. Neither value object gets an id.
 
-SQL Server has no `xmin`. Use a rowversion instead, and do not add both:
+On Npgsql EF Core 7+, `builder.Property<uint>("Version").IsRowVersion()` is the concise shorthand that automatically maps to PostgreSQL's `xmin` system column (`xid`, `ValueGeneratedOnAddOrUpdate`, concurrency token) without emitting a physical column. SQL Server has no `xmin`; use a `rowversion` instead, and do not add both:
 
 ```C#
 builder.Property<byte[]>("Version").IsRowVersion();
@@ -1979,7 +2000,7 @@ builder.Metadata.FindNavigation(nameof(Order.Lines))!
 
 The ordinary child navigation in this mapping needs `Include(o => o.Lines)` so the loaded aggregate contains its lines. If you use EF owned entities instead, owned navigations are automatically included with their owner; do not confuse that behavior with regular relationships. See [owned entity types](https://learn.microsoft.com/en-us/ef/core/modeling/owned-entities). Include them in the aggregate repository so `Cancel` sees the lines it must release. A query DTO should project in SQL and not rely on this include.
 
-Lazy-loading proxies are how a handler touches `order.Customer.Address` and runs SQL from a loop. Leave them off. If a use case needs another aggregate, the handler calls that aggregate's repository.
+Lazy-loading proxies are how a handler touches `order.Customer.Address` and runs SQL from a loop. They also force `virtual` navigation properties and unsealed domain classes (`sealed class Order` stops compiling with proxies), and they trigger hidden N+1 queries—or `ObjectDisposedException` once the `DbContext` closes—whenever a serializer, logger, or debugger touches a navigation property. Leave lazy loading off. Load child entities explicitly inside the root repository (`Include(o => o.Lines)`), and when a use case needs another aggregate, call that aggregate's repository.
 
 ### Concurrency token
 
@@ -2006,10 +2027,14 @@ public sealed class StockConfiguration : IEntityTypeConfiguration<Stock>
     public void Configure(EntityTypeBuilder<Stock> builder)
     {
         builder.ToTable("stock", table => table.HasCheckConstraint(
-            "ck_stock_counts", "\"Reserved\" >= 0 AND \"OnHand\" >= \"Reserved\""));
+            "ck_stock_counts", "reserved >= 0 AND on_hand >= reserved"));
         builder.HasKey(s => s.ProductId);
         builder.Property(s => s.ProductId)
+            .HasColumnName("product_id")
+            .ValueGeneratedNever()
             .HasConversion(id => id.Value, value => new ProductId(value));
+        builder.Property(s => s.OnHand).HasColumnName("on_hand");
+        builder.Property(s => s.Reserved).HasColumnName("reserved");
         builder.Ignore(s => s.Available);
         builder.Ignore(s => s.DomainEvents);
         builder.Property<uint>("xmin")
@@ -2033,7 +2058,9 @@ builder.HasQueryFilter(o => o.TenantId == tenantId);
 
 A captured value unrelated to the context instance can be retained in the cached model. Do not rely on a local captured by a configuration object to supply the current request's tenant; bind the predicate to a context member as in the documented pattern.
 
-:white_check_mark: **GOOD** Close over a property of this `DbContext`. EF parameterizes it and reads it again on each query.
+#### ✅ GOOD — bind the filter to a property on the `DbContext`
+
+Close over a property of this `DbContext`. EF parameterizes it and reads it again on each query.
 
 ```C#
 public Guid CurrentTenantId => _tenant.TenantId;
@@ -2094,6 +2121,21 @@ public sealed class EfUnitOfWork(OrderingDbContext db) : IUnitOfWork
 
 `AddAsync` does not call `SaveChanges`. `GetAsync` tracks. `FindAsync` for idempotency uses `AsNoTracking` so a lookup is not a second tracked `Order` fighting the one you are inserting.
 
+#### ❌ BAD — repository `SaveChanges` breaks the unit of work
+
+```C#
+public sealed class EfOrderRepository(OrderingDbContext db) : IOrderRepository
+{
+    public async Task AddAsync(Order order, CancellationToken cancellationToken)
+    {
+        db.Orders.Add(order);
+        await db.SaveChangesAsync(cancellationToken); // commits before Stock.Reserve runs!
+    }
+}
+```
+
+When every repository method saves on its own, `PlaceOrderHandler` commits the `Order` (and its outbox row) before `Stock.Reserve` checks inventory. If the second line is out of stock, the order is already committed with a partial reservation and `IUnitOfWork.CommitAsync` has nothing left to protect. Keep `SaveChangesAsync` strictly inside `EfUnitOfWork.CommitAsync`—one commit per handler.
+
 The filtered catch recognizes the named idempotency index only. Keep `PostgresException` in infrastructure. `UniqueConstraintViolationException` is the application type.
 
 `IPriceList` reading a catalog table:
@@ -2121,16 +2163,19 @@ If the price list is HTTP, `HttpPriceList` implements the same port, translates 
 ### Do not leak IQueryable
 
 ```C#
-// ❌ BAD — the application project now writes EF queries and references the provider
-public interface IOrderRepository
+// ❌ BAD — generic IRepository<T> + IQueryable leaks EF and breaks aggregate boundaries
+public interface IRepository<T> where T : class
 {
-    IQueryable<Order> Query();
+    IQueryable<T> Query();
+    Task AddAsync(T entity, CancellationToken cancellationToken);
+    void Update(T entity);
+    void Delete(T entity);
 }
 ```
 
-Callers compose `Include`, `Where`, and provider-specific functions in the handler. The port cannot be faked without an in-memory query provider that does not match PostgreSQL. Transaction rules move out of the aggregate and into whatever query the latest caller wrote.
+This fails in two ways at once. First, exposing `IQueryable<T>` lets application handlers compose `Include`, `Where`, and provider-specific functions—the port cannot be faked without an in-memory query provider that behaves differently from PostgreSQL. Second, a generic `IRepository<T>` erases the aggregate boundary: nothing stops a handler from injecting `IRepository<OrderLine>` to mutate a child line directly without `Order`'s invariants, or calling `Delete(order)` instead of `order.Cancel(...)`.
 
-Commands go through `GetAsync` / `AddAsync`. Reads go through a separate query interface that returns DTOs already projected. Both implementations use EF. Only the implementations are allowed to.
+Commands go through an aggregate-specific repository (`IOrderRepository` with `GetAsync` / `AddAsync`). Reads go through a separate query interface that returns DTOs already projected. Both implementations use EF. Only the implementations are allowed to.
 
 Specifications that are `Expression<Func<Order, bool>>` are `IQueryable` with a costume. A specification that is `bool IsSatisfiedBy(Order order)` is an in-memory predicate. It is fine on an aggregate you already loaded, and it is usually a method you could have put on `Order`. Prefer the method until you have two predicates you actually compose.
 
@@ -2160,12 +2205,14 @@ public static class OrderEndpoints
             PlaceOrderHandler handler,
             CancellationToken cancellationToken) =>
         {
-            var key = http.Request.Headers["Idempotency-Key"].ToString();
-            if (string.IsNullOrWhiteSpace(key))
-                return Results.Problem(title: "Missing idempotency key", statusCode: StatusCodes.Status400BadRequest);
+            if (!http.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues)
+                || keyValues.Count != 1
+                || string.IsNullOrWhiteSpace(keyValues[0]))
+                return Results.Problem(title: "Missing or duplicate idempotency key", statusCode: StatusCodes.Status400BadRequest);
+            var key = keyValues[0]!;
 
             if (request.ShipTo is null || request.Lines is null || request.Lines.Any(line => line is null))
-                return Results.Problem(title: "Shipping address and lines are required", statusCode: 400);
+                return Results.Problem(title: "Shipping address and lines are required", statusCode: StatusCodes.Status400BadRequest);
 
             Address address;
             try
@@ -2175,7 +2222,7 @@ public static class OrderEndpoints
             }
             catch (ArgumentException)
             {
-                return Results.Problem(title: "Invalid shipping address", statusCode: 400);
+                return Results.Problem(title: "Invalid shipping address", statusCode: StatusCodes.Status400BadRequest);
             }
 
             var actor = http.ToActor();
@@ -2208,6 +2255,18 @@ public static class OrderEndpoints
 Do not serialize `Order` as the response. The JSON shape becomes a public contract: private events, `ShipTo`, internal status names, whatever you add next month. `PlaceOrderResponse` is the contract. You can add a field to `Order` without breaking clients.
 
 Do not accept `unitPrice` on `LineRequest`. The handler prices from `IPriceList`. If a client sends a price anyway, the extra JSON property is ignored. Ignoring is better than honoring it.
+
+#### ❌ BAD — AutoMapper writing into aggregate setters
+
+```C#
+// Forces public setters on Order / OrderLine and skips Place, pricing, and domain events
+CreateMap<PlaceOrderRequest, Order>();
+CreateMap<LineRequest, OrderLine>();
+
+var order = mapper.Map<Order>(request); // Status, UnitPrice, and OrderPlaced are bypassed
+```
+
+Reflection-based mappers tempt teams to make aggregate setters `public` so the profile can assign fields directly. That bypasses factories, skips invariants, omits domain events, and turns a renamed property into a runtime surprise instead of a compile error. Map HTTP contracts to commands explicitly at the edge (as in `OrderEndpoints` above) and let the handler invoke `Order.Place` and `Order.Cancel`. For repetitive DTO-to-DTO projections on read models, prefer plain constructor calls, extension methods, or a compile-time source generator (such as Mapperly) rather than mapping into domain aggregates.
 
 ### Problem details
 
@@ -2273,6 +2332,8 @@ One converter per id type, or a factory converter. Do not `ToString()` an `Order
 ## Reads do not go through the aggregate
 
 `GetAsync` loads an `Order` so a command can change it. A list screen does not need `Cancel`, change tracking, or the event list. Tracking every row in a page of 50 turns a read into a memory tax and invites a bug where a serializer walks `Lines` and a later `SaveChanges` writes accidental mutations.
+
+This separation is **CQRS (Command Query Responsibility Segregation)** in its practical, in-process form: writes go through the aggregate and its invariants; reads go through a dedicated query port (SQL view, `AsNoTracking` projection, or Dapper) against the **same database**. CQRS does not require two databases, Event Sourcing, or MediatR—add a separate physical read table only when query latency or cross-context composition actually demands it (see [A separate read model](#a-separate-read-model)).
 
 ### Query objects
 
@@ -2513,7 +2574,7 @@ public sealed class OutboxMessageConfiguration : IEntityTypeConfiguration<Outbox
     {
         builder.ToTable("outbox_messages");
         builder.HasKey(m => m.Id);
-        builder.Property(m => m.Id).HasColumnName("id");
+        builder.Property(m => m.Id).HasColumnName("id").ValueGeneratedNever();
         builder.Property(m => m.Type).HasMaxLength(80).HasColumnName("type");
         builder.Property(m => m.Payload).HasColumnType("jsonb").HasColumnName("payload");
         builder.Property(m => m.OccurredAt).HasColumnName("occurred_at");
@@ -2521,15 +2582,18 @@ public sealed class OutboxMessageConfiguration : IEntityTypeConfiguration<Outbox
         builder.Property(m => m.LockedUntil).HasColumnName("locked_until");
         builder.Property(m => m.LockToken).HasColumnName("lock_token");
         builder.Property(m => m.AvailableAt).HasColumnName("available_at");
-        builder.HasIndex(m => new { m.AvailableAt, m.OccurredAt, m.Id })
-            .HasFilter("processed_at IS NULL");
+        builder.HasIndex(m => new { m.AvailableAt, m.Id })
+            .HasDatabaseName("ix_outbox_pending_available")
+            .HasFilter("processed_at IS NULL AND attempts < 10");
         builder.Property(m => m.Attempts).HasColumnName("attempts");
         builder.Property(m => m.LastError).HasMaxLength(500).HasColumnName("last_error");
     }
 }
 ```
 
-`Id` is the domain event's `EventId`, not a new guid. Republish uses the same id. `LockToken` identifies the current claim; `AvailableAt` provides retry backoff independently of the lease. The worker SQL uses the explicitly mapped snake_case columns. `jsonb` is PostgreSQL; use the appropriate JSON/text mapping on another provider.
+`Id` is the domain event's `EventId`, not a new guid. Republish uses the same id. `LockToken` identifies the current claim; `AvailableAt` provides retry backoff independently of the lease. Filtering the partial index on `processed_at IS NULL AND attempts < 10` excludes exhausted poison rows so they do not accumulate in the polling index forever, and indexing `(available_at, id)` matches the poll's `ORDER BY available_at, id` without a range column breaking sort order (see [Database_Indexing.md](Database_Indexing.md)). The worker SQL uses the explicitly mapped snake_case columns. `jsonb` is PostgreSQL; use the appropriate JSON/text mapping on another provider.
+
+**Distributed tracing across the outbox:** because `OutboxProcessor` runs on a `BackgroundService`, the original HTTP request's `Activity.Current` is gone by publish time. For OpenTelemetry end-to-end traces, store an optional `trace_parent` (and `trace_state`, or a `correlation_id`) column captured from `Activity.Current?.Id` when staging the row, then restore it as the parent `ActivityContext` (or message header) when `OutboxProcessor` publishes.
 
 The original guide copied events inside `EfUnitOfWork` before `SaveChanges`. That works until a caller calls `db.SaveChangesAsync` directly and the outbox stays empty. The interceptor runs for every save on this context.
 
@@ -2651,7 +2715,7 @@ public sealed class OutboxProcessor(
                 WHERE processed_at IS NULL AND attempts < 10
                   AND available_at <= clock_timestamp()
                   AND (locked_until IS NULL OR locked_until <= clock_timestamp())
-                ORDER BY occurred_at, id
+                ORDER BY available_at, id
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             )
             UPDATE ordering.outbox_messages AS m
@@ -2701,11 +2765,11 @@ public sealed class OutboxProcessor(
 
 Use `ToListAsync` directly on this data-modifying SQL; composing LINQ over it would require a subquery that cannot contain this statement. PostgreSQL permits row-locking in suitable subqueries; the limitation is not a blanket ban on `FOR UPDATE` in every subquery. `SqlQuery` is parameterized interpolation, not string-built SQL, and returns an unmapped DTO rather than a tracked aggregate.
 
-The database clock owns lease timestamps. If worker A's lease expires and B claims the row, B gets a new token; A's completion/failure update then affects zero rows and cannot clear B's lease. A can still have published, so delivery remains **at least once**. A broker acknowledgement proves acceptance, not consumer completion.
+The database clock owns lease timestamps. Keep the publish timeout (`30s`) well below the lease duration (`2 minutes`) so a slow broker call finishes or times out before another worker reclaims the row. If worker A's lease expires and B claims the row, B gets a new token; A's completion/failure update then affects zero rows and cannot clear B's lease. A can still have published, so delivery remains **at least once**. A broker acknowledgement proves acceptance, not consumer completion.
 
 Register `AddHostedService<OutboxProcessor>()` in a host that has the publisher adapter. Resolve scoped services inside the worker scope. If using MassTransit's Bus Outbox as well, the custom dispatcher must publish directly through the transport/`IBus`, not through the scoped outbox-aware `IPublishEndpoint`; otherwise it may stage another message and mark the original delivered without a broker send. Map each stored event name to its concrete contract, deserialize the payload, and set the transport `MessageId` to `EventId`.
 
-The pending-row index is a starting point; check its plan with real backlog sizes. Higher throughput can use parallel workers or a claimed batch with renewal and per-message tokens. Ordering across workers is not guaranteed by `ORDER BY occurred_at, id`. Required per-order sequencing needs an aggregate sequence and a partition/serialization policy.
+The pending-row index (`available_at, id WHERE processed_at IS NULL AND attempts < 10`) aligns range filtering with `ORDER BY available_at, id` and keeps exhausted poison rows out of the index; still verify its plan with real backlog sizes. Higher throughput can use parallel workers or a claimed batch with renewal and per-message tokens. Ordering across workers is not guaranteed by `ORDER BY available_at, id`. Required per-order sequencing needs an aggregate sequence and a partition/serialization policy.
 
 ### Inbox
 
@@ -2790,7 +2854,7 @@ CREATE TABLE ordering.order_events (
   type         text        NOT NULL,
   payload      jsonb       NOT NULL,
   occurred_at  timestamptz NOT NULL,
-  PRIMARY KEY (stream_id, version)
+  CONSTRAINT pk_order_events PRIMARY KEY (stream_id, version)
 );
 ```
 
@@ -2848,7 +2912,9 @@ public sealed class Order
         if (id.Value == Guid.Empty || customerId.Value == Guid.Empty)
             throw new DomainRuleException("Order and customer ids are required.");
         shipTo.EnsureValid();
-        if (lines.Any(line => line is null) || lines.Select(line => line.ProductId).Distinct().Count() != lines.Count)
+        if (lines.Any(line => line is null))
+            throw new DomainRuleException("Every line is required.");
+        if (lines.Select(line => line.ProductId).Distinct().Count() != lines.Count)
             throw new DomainRuleException("A product appears on at most one line.");
         if (lines.Select(line => line.UnitPrice.Currency).Distinct().Count() != 1)
             throw new DomainRuleException("An order uses one currency.");
@@ -2968,7 +3034,8 @@ public sealed class EventOrderRepository(OrderingDbContext db)
         {
             await db.SaveChangesAsync(cancellationToken);
         }
-        catch (DbUpdateException ex) when (PostgresUniqueViolation.Is(ex))
+        catch (DbUpdateException ex) when (ex.InnerException is Npgsql.PostgresException
+            { SqlState: "23505", ConstraintName: "pk_order_events" })
         {
             throw new ConflictException("The order stream moved. Reload and retry.");
         }
@@ -3169,14 +3236,27 @@ Timeout:
 ```C#
 public sealed class ExpireUnpaidOrders(
     IServiceScopeFactory scopes,
-    TimeProvider time) : BackgroundService
+    TimeProvider time,
+    ILogger<ExpireUnpaidOrders> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            await ExpireBatchAsync(stoppingToken);
-            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            try
+            {
+                await ExpireBatchAsync(stoppingToken);
+                await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Order expiry sweep failed; retrying");
+                await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+            }
         }
     }
 
@@ -3211,7 +3291,7 @@ public sealed class ExpireUnpaidOrders(
 }
 ```
 
-The query uses `AsNoTracking` and only ids. Each item gets a new scope/context; a failed stock update or concurrency conflict must not leave mutations that the next item's save accidentally commits. Treat only known state/concurrency conflicts as harmless; log and surface other failures rather than assuming every domain exception means "already paid". Run the timer with host-level error handling as for the outbox.
+The query uses `AsNoTracking`, selects only ids, and relies on the partial index `ix_orders_placed_expiry` (`placed_at WHERE status = 'Placed'`) so the minute sweep does not scan historical orders. Wrapping `ExecuteAsync` in a `try/catch` prevents a transient database outage from stopping the background service (or stopping the host under default `BackgroundServiceExceptionBehavior.StopHost`). Each item gets a new scope/context so a failed stock update or concurrency conflict never leaks tracked mutations into the next item. With multiple replicas, concurrent sweeps can pick the same 50 ids and collide on `xmin`; use `FOR UPDATE SKIP LOCKED` / leasing (like `OutboxProcessor`) if that contention becomes noisy. Treat only known state/concurrency conflicts as harmless; log and surface other failures rather than assuming every domain exception means "already paid".
 
 ```C#
 public sealed class MarkOrderPaymentFailedHandler(
@@ -3410,7 +3490,7 @@ public sealed class OrderSagaMachine : MassTransitStateMachine<OrderSaga>
 
 The deadline is measured from the order's business timestamp, not from when a delayed outbox message happens to start the saga. This example lets the persisted process state choose the capture-versus-timeout race. A strict wall-clock payment cutoff needs a separate agreed rule using verified capture time and reconciliation; scheduling alone does not enforce it.
 
-Cancellation is part of the process: without `OrderCancelledV1`, a captured payment can be accepted by the saga while the aggregate has already cancelled. A late capture after failure/cancellation publishes compensation. Distinct additional captures are refunded rather than silently discarded as duplicates. A rejection moves `ApplyingPayment` to `PaymentStopped`, while its consumer requests a refund. Production still needs provider receipt verification, reconciliation of stuck `ApplyingPayment`, refund-completion tracking, and operator visibility.
+Cancellation is part of the process: without `OrderCancelledV1`, a captured payment can be accepted by the saga while the aggregate has already cancelled. A late capture after failure/cancellation publishes compensation. Distinct additional captures are refunded rather than silently discarded as duplicates. Notice that in `During(ApplyingPayment)`, if `OrderCancelled` reaches the saga while `PayOrderConsumer` simultaneously hits `PaymentNoLongerAcceptedException`, both the consumer and the saga can publish `RefundRequired` for the same `PaymentId`—which is why the refund consumer must deduplicate on `PaymentId`. `When(OrderCancelled)` in `During(Paid)` is purely defensive for this `Order` state machine (where `Cancel` only allows `Placed`), guarding against future cancel-after-pay changes. A rejection moves `ApplyingPayment` to `PaymentStopped`, while its consumer requests a refund. Production still needs provider receipt verification, reconciliation of stuck `ApplyingPayment`, refund-completion tracking, and operator visibility.
 
 #### ❌ BAD — the state machine is a second aggregate
 
@@ -3439,7 +3519,7 @@ public sealed class OrderSagaMap : SagaClassMap<OrderSaga>
 
 The first four lines belong in `OrderingDbContext.OnModelCreating`; the class map is a separate type. `UsePostgres` selects the lock provider; explicitly choose `ConcurrencyMode.Pessimistic` below. Optimistic EF saga persistence needs a correctly mapped token (PostgreSQL `uint RowVersion` mapped to `xmin`, or SQL Server `byte[] RowVersion`), not a guessed `ISagaVersion` interface. See the [EF saga repository](https://masstransit.massient.com/configuration/saga-repositories/entity-framework).
 
-The saga and Consumer Outbox use the same scoped context/transaction. The custom interceptor leaves aggregate events intact while an enclosing transaction is open; its owner clears them after commit or disposes the scope. Do not accidentally share a custom outbox entity/table with MassTransit's `OutboxMessage`.
+The saga and Consumer Outbox use the same scoped context/transaction. Because MassTransit's EF Outbox calls `SaveChangesAsync` again on `OrderingDbContext` before committing and disposing the scope, the `db.Outbox.Local.Any(...)` guard in `OutboxInterceptor` is what prevents aggregate events (intentionally left uncleared while the enclosing transaction is open) from being staged twice. Do not accidentally share a custom outbox entity/table with MassTransit's `OutboxMessage`.
 
 ### One timeout
 
@@ -4441,7 +4521,7 @@ var updated = await db.Stock
         .SetProperty(s => s.Reserved, s => s.Reserved + quantity), cancellationToken);
 
 if (updated == 0)
-    throw new DomainRuleException("Not enough stock.");
+    throw new DomainRuleException("Not enough stock or unknown product."); // 0 rows covers both missing row and insufficient Available
 ```
 
 That statement is infrastructure. `ExecuteUpdate` executes immediately, bypassing change tracking, automatic concurrency-token checks, `SaveChanges` interception, `Stock.Reserve`, and its domain event. The predicate is the concurrency guard. To combine it with an order/outbox write, use one explicit transaction; a later implicit `SaveChanges` transaction does not include a previously executed statement. Do not retain a stale tracked `Stock` that later overwrites this update. If you take this path for the hot SKU, the repository method is `TryReserve` on the port and it returns whether the update hit, and the handler raises or the SQL is paired with an outbox insert in the same transaction. Do not leave a second writer that "also updates stock" through `ExecuteUpdate` while `ShipOrderHandler` uses the aggregate. One writer per column.
@@ -4450,7 +4530,7 @@ See [EF Core ExecuteUpdate](https://learn.microsoft.com/en-us/ef/core/saving/exe
 
 ## What to skip
 
-- **Generic `IRepository<T>` returning `IQueryable<T>`.** Each root has its own load rules. The queryable port is EF in the application layer.
+- **Generic `IRepository<T>` returning `IQueryable<T>`.** Each root has its own load rules and a generic repo lets callers inject `IRepository<OrderLine>` directly. See [Do not leak IQueryable](#do-not-leak-iqueryable).
 - **Public setters on aggregates that need guarded transitions.** A simple CRUD model may remain a data model; the rich checkout model must route changes through its behavior.
 - **One `DbContext` shared by ordering and billing.** One migration history, one word `Order` meaning two things, and a navigation the teams will use because it is there.
 - **Four class libraries on the first CRUD screen.** Split when a second adapter or a real invariant shows up. Keep the dependency direction in folders until then.
@@ -4462,11 +4542,11 @@ See [EF Core ExecuteUpdate](https://learn.microsoft.com/en-us/ef/core/saving/exe
 - **A MassTransit saga that calls `Order.MarkPaid`.** The saga publishes `PayOrder`. The handler loads the aggregate. A saga and `ExpireUnpaidOrders` must not both expire the same order. See [Saga with MassTransit](#saga-with-masstransit).
 - **Client-supplied prices and tenant ids.** The price comes from `IPriceList`. The tenant comes from the principal.
 - **`OFFSET` pagination on the order list.** Page with `(placed_at, id)`.
-- **Lazy-loading proxies** so the model can reach into another aggregate by accident.
+- **Lazy-loading proxies** so the model can reach into another aggregate by accident, force unsealed/virtual types, or fire hidden N+1 SQL. See [Backing fields and child lines](#backing-fields-and-child-lines).
 - **Soft-delete on orders that still have a unique idempotency key.** Cancel is a status. A hidden row still occupies the unique index.
 - **Holding a stock row lock across a payment HTTP call.** Commit the reserve, then talk to the vendor, then mark paid from the webhook.
-- **An in-memory "unit of work" interface plus a repository `Save` on every method.** You will commit partial graphs. One `CommitAsync` per handler.
-- **AutoMapper profiles that write into aggregate setters** you made public for the mapper. Map DTOs at the edge. Call `Place` and `Cancel` for changes.
+- **An in-memory "unit of work" interface plus a repository `Save` on every method.** You will commit partial graphs. One `CommitAsync` per handler. See [Repository](#repository).
+- **AutoMapper profiles that write into aggregate setters** you made public for the mapper. Map DTOs at the edge. Call `Place` and `Cancel` for changes. See [Contracts](#contracts).
 - **Sharing `Money` in a shared kernel the moment billing needs negative amounts.** Duplicate the struct.
 - **Six projects because a hexagon has six sides.** HTTP and PostgreSQL are two adapters. A folder is enough until a SDK should not compile into the web host.
 - **Loading every dll in the host output, or a dll from a request.** Load the names in configuration, from a `modules` directory you deployed, once at startup. See [Load modules from disk](#load-modules-from-disk).
@@ -4474,6 +4554,12 @@ See [EF Core ExecuteUpdate](https://learn.microsoft.com/en-us/ef/core/saving/exe
 - **One `DbContext` for every module because there is one process.** The process is shared. The model, the schema, and the migration history are not.
 - **A vertical slice with its own `Order` class.** Slices in one module share the aggregate. Copying the entity per feature puts the status rules back in each handler.
 - **MediatR as the definition of a slice.** A folder, a handler, and `Map` on the endpoint are the slice. A mediator is optional. See [a pipeline without a mediator](#a-pipeline-without-a-mediator).
+- **Assuming CQRS requires two databases, Event Sourcing, and a mediator.** A read port backed by a SQL view or `AsNoTracking` projection against the same database already separates reads from the aggregate.
+- **`AddDbContextPool` with scoped tenant state or scoped interceptors.** A pooled context survives across requests; capturing a tenant once or forgetting to reset it leaks one tenant's rows to another.
+- **A `BackgroundService` loop without a `try/catch` around its poll iteration.** One transient database failure stops the worker (and shuts down the host under default `BackgroundServiceExceptionBehavior.StopHost`), leaving outbox rows or unpaid holds stuck.
+- **A partial outbox index that retains poison rows or puts a range column ahead of `ORDER BY`.** Exclude exhausted rows (`processed_at IS NULL AND attempts < 10`) and align the index keys with the poll's `ORDER BY`.
+- **Catching every unique-constraint error (`23505` / `2601` / `2627`) without checking the constraint name.** An unrelated unique violation or idempotency collision will be misreported as a stream-version conflict or a successful replay.
+- **Overriding `Equals` / `GetHashCode` on entities that still have a database-generated `0` id.** Two unsaved entities become "equal", and mutating the id on save corrupts `HashSet` and `Dictionary` lookups.
 
 ## Checklist
 
