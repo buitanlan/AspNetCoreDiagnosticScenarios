@@ -60,6 +60,7 @@
   - [OR trên hai cột](#or-trên-hai-cột-một-index-không-đủ-phễu)
   - [Index phình to](#index-phình-to-bloat-fragmentation-reindex)
 - [Phần 7. Kỹ thuật thao tác dữ liệu hiệu quả](#phần-7-kỹ-thuật-thao-tác-dữ-liệu-hiệu-quả)
+  - [Locking & Deadlock do Index](#locking--deadlock-do-index-gap-lock-next-key-lock-và-key-range-lock)
   - [Tranh chấp khóa](#tranh-chấp-khóa-khi-bộ-đếm-bị-nghẽn-cổ-chai)
   - [UPDATE … JOIN](#cập-nhật-dữ-liệu-từ-bảng-khác-join-trong-update)
   - [RETURNING / OUTPUT](#lấy-dữ-liệu-ngay-sau-khi-thay-đổi-returning--output)
@@ -103,6 +104,7 @@
   - [BRIN / columnstore](#brin--columnstore-chọn-theo-workload)
   - [Thống kê](#thống-kê-histogram-và-index-có-mà-không-seek)
   - [Invisible / disable](#invisible--disable-trước-khi-drop)
+  - [Bẫy ORM (EF Core / Dapper)](#bẫy-orm-ef-core--dapper-code-sạch-nhưng-plan-xấu)
   - [Trước khi CREATE INDEX](#trước-khi-create-index)
 - [Phần 11. Quy trình tối ưu và thực hành](#phần-11-quy-trình-tối-ưu-và-thực-hành)
   - [Đo trước và sau theo workload](#đo-trước-và-sau-theo-workload)
@@ -582,36 +584,76 @@ Ví dụ đánh giá dọn dẹp:
 
 ### Nguyên tắc 4: Quét khi gặp điều kiện phạm vi — Điều kiện phạm vi "phá vỡ" phễu
 
-Trong một lượt scan B-tree thông thường, equality trên prefix và range ở cột kế tiếp xác định khoảng đọc chủ yếu. Cột sau range vẫn có thể được kiểm tra trong index để giảm heap/Key Lookup, nhưng thường không tạo một khoảng hẹp liên tục như equality prefix.
+Trong một lượt scan B-tree thông thường, equality trên prefix và range ở cột kế tiếp xác định khoảng đọc chủ yếu. Cột đứng sau range vẫn có thể được kiểm tra ngay trên index (như **Index Condition Pushdown — ICP** trên MySQL, hay residual filter trên leaf) để giảm heap/Key Lookup, nhưng không tạo ra một khoảng hẹp liên tục như equality prefix.
 
-Ví dụ `WHERE country = 'VN' AND age > 28 AND married = 'yes'`:
+Xét query:
+
+```sql
+WHERE country = 'VN' AND age > 28 AND married = 'yes'
+```
+
+Với index `(country, age, married)`, sau khi `age > 28` bắt đầu scan, các giá trị `married = 'no'` và `'yes'` nằm xen kẽ nhau:
+
+```
+Index (country, age, married):
+┌──────────┬─────┬─────────┐
+│ country  │ age │ married │
+├──────────┼─────┼─────────┤
+│ VN       │ 25  │ no      │
+│ VN       │ 27  │ yes     │
+│ VN       │ 29  │ no      │  ← age > 28 bắt đầu scan từ đây
+│ VN       │ 29  │ yes     │  ← married = 'yes' ✅
+│ VN       │ 31  │ no      │  ← married = 'no'  ❌ (vẫn phải đọc qua!)
+│ VN       │ 31  │ yes     │  ← married = 'yes' ✅
+│ VN       │ 35  │ no      │  ← married = 'no'  ❌ (vẫn phải đọc qua!)
+│ VN       │ 42  │ yes     │  ← married = 'yes' ✅
+└──────────┴─────┴─────────┘
+```
+
+Đổi sang `(country, married, age)` — đưa equality lên trước range:
+
+```
+Index (country, married, age):
+┌──────────┬─────────┬─────┐
+│ country  │ married │ age │
+├──────────┼─────────┼─────┤
+│ VN       │ no      │ 25  │
+│ VN       │ no      │ 29  │  ← block married = 'no' bị bỏ qua hoàn toàn
+│ VN       │ no      │ 31  │
+│ VN       │ no      │ 35  │
+│ VN       │ yes     │ 27  │
+│ VN       │ yes     │ 29  │  ← Seek: country='VN', married='yes', age>28
+│ VN       │ yes     │ 31  │  ← scan liên tục, không phải loại entry
+│ VN       │ yes     │ 42  │
+└──────────┴─────────┴─────┘
+```
 
 | Index | Khoảng đọc thông thường | Điều kiện còn lại |
 | --- | --- | --- |
-| `(country, age, married)` | Các entry country=VN, age>28 | Lọc married trong khoảng đó |
-| `(country, married, age)` | Entry country=VN, married=yes, age>28 | Không còn filter này |
+| `(country, age, married)` | Mọi entry `country = 'VN'`, `age > 28` | Lọc `married = 'yes'` trong khoảng đó |
+| `(country, married, age)` | Đúng entry `country = 'VN'`, `married = 'yes'`, `age > 28` | Không còn filter `married` |
 
-Với hai range `age > 25 AND salary > 20000000`, so sánh index `(country, age, salary)` và `(country, salary, age)` bằng **phân bố trong country đang query**, không chỉ selectivity toàn bảng. Còn phải xét ORDER BY, LIMIT và query khác dùng chung index.
+Khi có **nhiều điều kiện range** (`WHERE country = 'VN' AND age > 25 AND salary > 20000000`), một lượt scan thông thường chỉ dùng được range đầu tiên để thu hẹp khoảng đọc, cột range thứ hai dùng để lọc. Hãy so sánh `(country, age, salary)` với `(country, salary, age)` dựa trên **phân bố dữ liệu thực tế trong `country` đang query** (ví dụ nếu 90% có `age > 25` nhưng chỉ 10% có `salary > 20M`, `salary` đặt trước thường hẹp hơn), đồng thời cân nhắc `ORDER BY`, `LIMIT` và các query khác dùng chung index.
 
-#### Ngoại lệ: Skip Scan, nhiều range và index combination
+#### Ngoại lệ: Skip Scan, nhiều range, ICP và index combination
 
-- PostgreSQL 18 hỗ trợ B-tree skip scan: có thể chạy nhiều lần tìm với các giá trị prefix suy ra, hữu ích khi số giá trị prefix ít. Trước 18, index thiếu cột đầu vẫn có thể được scan; không đồng nghĩa “không dùng được”.
-- MySQL có Skip Scan cho một số query với điều kiện cụ thể. Loose Index Scan cho GROUP BY là tối ưu khác; không dùng hai tên thay thế nhau.
-- Oracle có Index Skip Scan. SQL Server không có access path skip scan tổng quát như Oracle; có thể scan hoặc kết hợp index.
-- Bitmap AND/OR, Index Merge/Intersection hoặc nhiều seek cũng có thể tận dụng nhiều điều kiện. Không giả định mọi query chỉ có một lần seek và một range.
+- **PostgreSQL 18+** hỗ trợ **B-tree skip scan**: có thể chạy nhiều lần tìm với các giá trị prefix suy ra, hữu ích khi số giá trị distinct ở prefix ít. Trước PG 18, index thiếu cột đầu vẫn có thể được scan; không đồng nghĩa "không dùng được".
+- **MySQL** có **Index Skip Scan** (8.0.13+) cho một số query với điều kiện cụ thể; **Loose Index Scan** cho `GROUP BY` là tối ưu khác — không dùng hai tên thay thế nhau. Ngoài ra MySQL có **Index Condition Pushdown (ICP)** (`Extra: Using index condition` trong `EXPLAIN`), đẩy predicate ở cột sau range/cột bị bỏ qua xuống storage engine để lọc ngay trên leaf trước khi lookup PK.
+- **Oracle** có Index Skip Scan. **SQL Server** không có access path skip scan tổng quát như Oracle; có thể scan hoặc kết hợp index.
+- **Bitmap AND/OR**, **Index Merge/Intersection** hoặc nhiều seek cũng có thể tận dụng nhiều điều kiện. Không giả định mọi query chỉ có một lần seek và một range.
 
-Vì vậy, “range cắt phễu” là mô hình cơ bản, không phải tuyên bố mọi cột phía sau chỉ có thể filter. [PostgreSQL: multicolumn B-tree và skip scan](https://www.postgresql.org/docs/18/indexes-multicolumn.html), [MySQL: range optimization](https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html).
+Vì vậy, "range cắt phễu" là mô hình cơ bản để thiết kế, không phải tuyên bố mọi cột phía sau chỉ có thể bỏ đi. [PostgreSQL: multicolumn B-tree và skip scan](https://www.postgresql.org/docs/18/indexes-multicolumn.html), [MySQL: range optimization](https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html), [MySQL: Index Condition Pushdown](https://dev.mysql.com/doc/refman/8.4/en/index-condition-pushdown-optimization.html).
 
 #### Công thức ban đầu để thử
 
-`IS NULL` có thể đóng vai trò equality; `IN (...)` thường tạo nhiều giá trị equality; prefix LIKE có thể tạo range khi operator/collation phù hợp. Có nhiều giá trị IN ở cột đầu thì thứ tự toàn cục của cột sau chưa chắc đáp ứng ORDER BY.
+`IS NULL` có thể đóng vai trò equality; `IN (...)` thường tạo nhiều giá trị equality; prefix `LIKE` có thể tạo range khi operator/collation phù hợp. Khi có nhiều giá trị `IN` ở cột đầu thì thứ tự toàn cục của cột sau chưa chắc đáp ứng `ORDER BY`.
 
 ```text
 INDEX (equality_prefix, range_hoặc_ORDER_BY, ...)
 INCLUDE (payload cần để covering)
 ```
 
-Đây là đề xuất để đo. Nếu range ở cột A nhưng ORDER BY ở cột B, phải cân nhắc **lọc trước rồi sort** hoặc **đọc theo B rồi filter A và dừng theo LIMIT**. Không có một công thức key duy nhất thắng cả hai. Cột INCLUDE có thể hỗ trợ residual filter, nhưng không định vị seek hay cung cấp thứ tự.
+Đây là đề xuất để đo. Nếu range ở cột `A` nhưng `ORDER BY` ở cột `B`, phải cân nhắc giữa **lọc trước theo `A` rồi sort** hoặc **đọc theo thứ tự `B`, lọc `A` và dừng sớm theo `LIMIT`**. Không có một công thức key duy nhất thắng cả hai. Cột `INCLUDE` có thể hỗ trợ residual filter, nhưng không định vị seek hay cung cấp thứ tự.
 
 Sau cùng kiểm tra rows read, lookup, sort và chi phí ghi; xem [Phần 3](#phần-3-đọc-execution-plan-trong-30-giây).
 
@@ -646,37 +688,48 @@ Không cộng thời gian/cost/buffers của mọi node thành tổng: node cha 
 
 ### Đỏ — cần điều tra bằng số liệu
 
-| Dấu hiệu | Giả thuyết cần kiểm tra |
-| --- | --- |
-| Lọc hẹp nhưng đọc rất nhiều row/page | Sai prefix, residual filter, biểu thức/cast, statistics hoặc parameter khác lúc compile |
-| Key/RID Lookup lặp nhiều, logical reads cao | Index thiếu payload cần lấy; cân nhắc covering hoặc projection hẹp |
-| Sort/Hash spill ra tempdb/disk | Ước lượng sai, row rộng, memory grant/work_mem hoặc lượng dữ liệu lớn; index có thể giúp nhưng không luôn là đáp án |
-| Nested Loop có inner scan lặp nhiều | Access path inner, cardinality outer, spool hoặc khả năng dùng hash/merge join |
-| Estimated rows lệch actual tại node quyết định plan | Statistics, correlation, parameter sensitivity hoặc predicate khó ước lượng |
+Bảng ánh xạ nhanh dấu hiệu trên plan của 3 hệ (nhớ kiểm tra **actual rows / reads / loops**, không kết luận chỉ từ tên operator):
 
-MySQL `Using filesort` chỉ cho biết sort ngoài thứ tự index, **không bảo đảm ghi ra đĩa**; `Using temporary` cũng không đồng nghĩa disk spill. PostgreSQL `Recheck Cond` thuộc cơ chế bitmap/lossy index, không tự chứng minh filter bị bỏ khỏi index.
+| Dấu hiệu | SQL Server | PostgreSQL | MySQL (`type` / `Extra`) | Giả thuyết cần kiểm tra |
+| --- | --- | --- | --- | --- |
+| Lọc hẹp nhưng đọc rất nhiều row/page | `Table Scan`, `Clustered Index Scan`, `Index Scan` (hoặc `Index Seek` có `Rows Read` lớn) | `Seq Scan` / `Index Scan` + `Rows Removed by Filter` lớn | `type=ALL` / `index` + `Using where` | Sai prefix, residual filter, hàm/cast trên cột, thống kê cũ hoặc parameter khác lúc compile |
+| Lookup lặp nhiều, logical reads cao | `Key Lookup` / `RID Lookup` × số lần lớn | `Index Scan` + heap fetch nhiều; `Index Only Scan` có `Heap Fetches` lớn | PK lookup sau secondary (không có `Using index`) | Index chưa covering → cân nhắc `INCLUDE` / thu hẹp `SELECT`, hoặc autovacuum (PG) |
+| Sort / Hash tràn đĩa (spill) | `Sort` / `Hash Match` có warning `Spill to TempDb` | `Sort Method: external merge Disk`; `Hash Batches > 1` | `Using filesort` / `Using temporary` *(xem lưu ý dưới)* | Ước lượng sai, row rộng, memory grant/`work_mem` thiếu, hoặc thiếu index đúng `ORDER BY` |
+| Nested Loop lặp inner lớn | `Nested Loops` với `Number of Executions` lớn × inner Scan | `Nested Loop` `loops` lớn × inner `Seq Scan` | `type=ALL` ở bảng trong join | Thiếu index join/FK, cardinality outer ước lượng quá thấp, nên là Hash/Merge Join |
+| Ước lượng lệch thực tế tại node quyết định | `Estimated` lệch xa `Actual Rows` | `rows` ước lượng lệch xa `actual rows` | `rows` ước lượng lệch xa thực tế | Statistics cũ, cột tương quan, parameter sensitivity hoặc predicate khó ước lượng |
+
+> [!NOTE]
+> MySQL `Using filesort` chỉ cho biết sort ngoài thứ tự index, **không bảo đảm ghi ra đĩa**; `Using temporary` cũng không đồng nghĩa disk spill; `Using index condition` là tín hiệu **tốt** (Index Condition Pushdown — lọc trên leaf trước khi lookup bảng). PostgreSQL `Recheck Cond` thuộc cơ chế bitmap/lossy index, không tự chứng minh filter bị bỏ khỏi index.
 
 ### Vàng — chưa chắc sai
 
 - Scan bảng/index lớn có thể đúng khi cần nhiều row; scan covering index hẹp có thể rất rẻ.
-- Bitmap Heap Scan đọc heap theo block; nó thường hợp lý với lượng match trung bình nhưng làm mất thứ tự index.
-- Hash Join/HashAggregate có thể thắng các lookup lặp lại. Sort nhỏ trong RAM thường chấp nhận được.
-- `CONVERT_IMPLICIT` cần xem nằm ở cột hay tham số và có warning/reads cao không; không phải conversion nào cũng chặn seek.
+- `Bitmap Heap Scan` đọc heap theo block; thường hợp lý với lượng match trung bình nhưng làm mất thứ tự index.
+- `Hash Join` / `HashAggregate` có thể thắng các lookup lặp lại. Sort nhỏ trong RAM thường chấp nhận được.
+- `CONVERT_IMPLICIT` cần xem nằm ở **cột** hay **tham số** và có warning/reads cao không; không phải conversion nào cũng chặn seek.
 
 ### Xanh — kết quả đã được kiểm chứng
 
 - Query trả đúng dữ liệu và đạt mục tiêu latency/CPU/reads trên tham số đại diện.
 - Predicate và key order giảm công việc đọc; lookup/sort nếu còn có chi phí chấp nhận được.
 - Không có regression đáng kể ở write path hoặc query khác.
-- Cardinality đủ sát ở các node ảnh hưởng quyết định. Không dùng ngưỡng “lệch dưới 10 lần” như chứng nhận plan tốt.
+- Cardinality đủ sát ở các node ảnh hưởng quyết định. Không dùng ngưỡng "lệch dưới 10 lần" như chứng nhận plan tốt.
 
 ### 30 giây — checklist
 
-1. Xác định query, tham số, số kết quả và mức độ chậm; có phải lock wait/I/O/network thay vì thiếu index?
-2. Đo actual rows/read/loops và logical reads; tìm nơi đọc nhiều rồi loại bỏ nhiều.
+1. Xác định query, tham số, số kết quả và mức độ chậm; kiểm tra xem có phải lock wait / I/O / network thay vì thiếu index không.
+2. Đo `actual rows` / `rows read` / `loops` và logical reads; tìm nơi **đọc nhiều rồi loại bỏ nhiều**.
 3. Kiểm tra key prefix, residual filter, lookup, sort/spill và statistics.
-4. Thử một thay đổi, đối chiếu kết quả và số liệu trước/sau với cả giá trị hiếm lẫn phổ biến.
+4. Thử **một** thay đổi, đối chiếu kết quả và số liệu trước/sau với cả giá trị hiếm lẫn phổ biến.
 5. Đo tác động dung lượng/ghi và giữ cách rollback. Quy trình chi tiết ở [Phần 11](#phần-11-quy-trình-tối-ưu-và-thực-hành).
+
+```text
+Đọc nhiều, trả ít (Scan/Seek + Filter)  →  kiểm tra prefix, SARGability, thống kê
+Key/RID Lookup hoặc Heap Fetches lớn    →  covering (INCLUDE) / bớt cột SELECT / VACUUM
+Sort / Hash spill ra đĩa                →  index khớp ORDER BY, thống kê, độ rộng row
+Nested Loop × inner Scan lặp lớn        →  index cho cột JOIN / FK, hoặc kiểm tra cardinality
+Estimated lệch xa Actual ở node chính   →  ANALYZE / UPDATE STATISTICS / parameter sniffing
+```
 
 ## Phần 4. Index hoạt động thế nào với từng thao tác SQL
 
@@ -690,28 +743,35 @@ Optimizer có thể đẩy filter xuống, đổi thứ tự join hoặc chọn 
 
 ### Phép so sánh không bằng (!=): Xem phân bố trước khi kết luận
 
-`status <> 'open'` tương ứng các giá trị nhỏ hơn hoặc lớn hơn 'open', và loại NULL. Engine có thể dùng hai range, nhiều seek hoặc scan; **không bắt buộc đọc toàn bộ index**. Statistics/histogram giúp ước lượng số row match, dù ước lượng vẫn có thể sai.
+`status <> 'open'` tương ứng các giá trị nằm ở **hai phía** (`< 'open'` hoặc `> 'open'`) và loại bỏ `NULL`:
 
-```sql
-SELECT * FROM payments
-WHERE shop_id = 42 AND status <> 'open';
--- (shop_id, status) giới hạn công việc trong một shop trước.
+```text
+Index (status):
+[cancelled | cancelled | open | open | open | paid | paid | refunded]
+     ✅          ✅        ❌     ❌     ❌     ✅     ✅      ✅
+  ←───── < 'open' ─────→                       ←──── > 'open' ─────→
 ```
 
-Nếu 'open' chiếm gần toàn bộ bảng thì phần còn lại có thể rất selective. Nếu phần còn lại chiếm đa số, scan thường hợp lý. Không có phép so sánh nào “luôn giết index”.
+Engine có thể thực thi bằng hai range scan, nhiều seek hoặc table scan; **không bắt buộc đọc toàn bộ index**. Statistics/histogram giúp ước lượng số row match (dù ước lượng vẫn có thể sai). Nếu `'open'` chiếm gần toàn bộ bảng thì phần còn lại rất selective và index vẫn phát huy tác dụng; ngược lại nếu phần còn lại chiếm đa số, full scan thường hợp lý. Không có phép so sánh nào "luôn giết index".
 
-Có thể thử `IN ('paid', 'cancelled', 'refunded')` **chỉ khi tập trạng thái đầy đủ được ràng buộc và ngữ nghĩa đúng**; thêm trạng thái mới có thể làm kết quả khác `<> 'open'`. Viết IN không tự làm cùng tập kết quả rẻ hơn.
+Các hướng tối ưu khi query với `<>` đọc quá nhiều:
 
-Với query cố định, partial/filtered index vừa thu hẹp dữ liệu vừa giữ thứ tự cần dùng:
+1. **Thêm equality prefix thu hẹp phạm vi trước:**
+   ```sql
+   SELECT * FROM payments
+   WHERE shop_id = 42 AND status <> 'open';
+   -- Index (shop_id, status) giới hạn công việc trong một shop trước.
+   ```
+2. **Dùng `IN (...)` có điều kiện:** có thể thử `IN ('paid', 'cancelled', 'refunded')` **chỉ khi tập trạng thái đầy đủ được ràng buộc và ngữ nghĩa đúng** — nếu sau này thêm trạng thái mới, kết quả sẽ khác `<> 'open'`. Viết `IN` cũng không tự làm cùng một tập kết quả rẻ hơn.
+3. **Partial / filtered index cho query cố định:** vừa thu hẹp dữ liệu vừa giữ được thứ tự `ORDER BY` cần dùng:
+   ```sql
+   -- PostgreSQL / SQL Server: giả định status là kiểu chuỗi phù hợp
+   CREATE INDEX payments_not_open
+   ON payments (shop_id, created_at)
+   WHERE status <> 'open';
+   ```
 
-```sql
--- PostgreSQL / SQL Server: giả định status là kiểu chuỗi phù hợp
-CREATE INDEX payments_not_open
-ON payments (shop_id, created_at)
-WHERE status <> 'open';
-```
-
-MySQL có thể dùng generated/functional column cho biểu thức boolean từ 8.0.13+, nhưng index boolean không tự tăng selectivity; nên kết hợp shop/order và đo plan. [MySQL: các toán tử hỗ trợ range](https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html).
+MySQL có thể dùng generated/functional column cho biểu thức boolean từ 8.0.13+, nhưng index boolean đơn không tự tăng selectivity; nên kết hợp cột `shop_id`/sort và đo plan. [MySQL: các toán tử hỗ trợ range](https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html).
 
 ### NULL: Giá trị đặc biệt cần đặc biệt chú ý
 
@@ -896,7 +956,8 @@ OUTER APPLY (
   ORDER BY created_at DESC, id DESC
 ) AS recent_sales;
 
--- Index cần: (customer_id, created_at DESC) trên sales
+-- Index cần: (customer_id, created_at DESC, id DESC) trên sales
+-- (phải có id DESC để khớp tie-breaker và tránh Sort trên cả PG lẫn SQL Server)
 ```
 
 
@@ -995,7 +1056,7 @@ FROM (
 WHERE rn = 1;
 ```
 
-Filter trước window có thể đổi ngữ nghĩa: “đơn mới nhất trong năm” khác “đơn mới nhất toàn lịch sử rồi chỉ giữ đơn của năm đó”. Index đứng đầu created_at có thể lọc tốt nhưng không cung cấp thứ tự theo customer_id. Filter rn=1 không phải seek key thông thường, dù engine có thể có tối ưu top-N/window. So sánh window với LATERAL/APPLY bằng tập khách và số row thực tế.
+Filter trước window có thể đổi ngữ nghĩa: "đơn mới nhất trong năm" khác "đơn mới nhất toàn lịch sử rồi chỉ giữ đơn của năm đó". Index đứng đầu `created_at` có thể lọc tốt nhưng không cung cấp thứ tự theo `customer_id`. Filter `rn = 1` không phải seek key thông thường, dù engine có thể có tối ưu top-N/window. So sánh window với `LATERAL`/`APPLY` bằng tập khách và số row thực tế.
 
 ## Phần 5. Tại sao Database không dùng Index của tôi
 
@@ -1076,11 +1137,16 @@ Index ẩn (MySQL): kiểm tra `IS_VISIBLE` trong `INFORMATION_SCHEMA.STATISTICS
 
 Predicate **SARGable** (Search ARGument Able) là predicate có thể chuyển thành điều kiện tìm theo key của access path. So sánh trực tiếp cột với tham số đúng kiểu thường dễ tối ưu; biểu thức đã được index cũng có thể SARGable trên expression index.
 
+**Bẫy collation Case-Insensitive (CI) vs Case-Sensitive (CS) với `LOWER(email)`:**
+
+- **SQL Server / MySQL** thường dùng collation mặc định **Case-Insensitive** (như `SQL_Latin1_General_CP1_CI_AS`, `utf8mb4_0900_ai_ci`). Với cột dùng collation CI, `WHERE email = 'a@b.com'` **đã tự không phân biệt hoa thường** và dùng được Index Seek bình thường — nếu bạn bọc thêm `WHERE LOWER(email) = 'a@b.com'`, bạn lại **tự tay phá Seek**!
+- **PostgreSQL** mặc định **Case-Sensitive**, nên cần `LOWER(email)` + expression index `(LOWER(email))`, hoặc `citext` / nondeterministic ICU collation (lưu ý: ICU nondeterministic collation trên PostgreSQL có hạn chế với toán tử `LIKE`).
+
 ### Full table scan nhanh hơn: Khi database đúng mà bạn sai
 
 Scan có thể rẻ hơn khi phải lấy nhiều row qua lookup. Không có ngưỡng 10–30% áp dụng chung: tipping point phụ thuộc row/index width, covering, heap correlation, cache, storage và parallelism.
 
-PostgreSQL: random_page_cost mô hình hóa chi phí I/O, không phải công tắc ép dùng index. Có thể thử trong session đã benchmark; SSD không tự chứng minh giá trị 1.1 là đúng:
+PostgreSQL: `random_page_cost` mô hình hóa chi phí I/O, không phải công tắc ép dùng index. Có thể thử trong session đã benchmark; SSD không tự chứng minh giá trị `1.1` là đúng:
 
 ```sql
 SET random_page_cost = 1.1;
@@ -1129,20 +1195,24 @@ SELECT * FROM orders WHERE status = @status OPTION (RECOMPILE);
 -- Hoặc OPTIMIZE FOR UNKNOWN — dùng density trung bình, không sniff giá trị cụ thể
 ```
 
-**PostgreSQL:** prepared statement có custom/generic plan. So sánh bằng EXPLAIN EXECUTE với tham số đại diện; force_custom_plan (PG 12+) chỉ là lựa chọn có chi phí planning, không cần bỏ prepared statement mặc định.
+**PostgreSQL:** prepared statement có custom/generic plan. So sánh bằng `EXPLAIN EXECUTE` với tham số đại diện; `plan_cache_mode = force_custom_plan` (PG 12+) chỉ là lựa chọn có chi phí planning, không cần bỏ prepared statement mặc định.
 
-**SQL Server:** PSP từ 2022 với compatibility level 160 và cấu hình phù hợp có thể giữ nhiều plan cho predicate đủ điều kiện. OPTION(RECOMPILE) đánh đổi CPU compile; OPTIMIZE FOR UNKNOWN dùng ước lượng trung bình nên vẫn có thể kém cho cả hai cực. Statistics mới không tự giải quyết mọi skew. [PSP](https://learn.microsoft.com/en-us/sql/relational-databases/performance/parameter-sensitive-plan-optimization?view=sql-server-ver17).
+**SQL Server:** PSP từ 2022 với compatibility level 160 và cấu hình phù hợp có thể giữ nhiều plan cho predicate đủ điều kiện. `OPTION (RECOMPILE)` đánh đổi CPU compile; `OPTIMIZE FOR UNKNOWN` dùng ước lượng trung bình nên vẫn có thể kém cho cả hai cực. Statistics mới không tự giải quyết mọi skew. [PSP](https://learn.microsoft.com/en-us/sql/relational-databases/performance/parameter-sensitive-plan-optimization?view=sql-server-ver17).
 
-**MySQL:** cache cấu trúc prepared statement không đồng nghĩa tái sử dụng plan theo kiểu parameter sniffing của SQL Server. MySQL lặp bước optimize khi execute; cập nhật statistics khi cần, nhưng chẩn đoán theo engine thực tế. [Prepared statement cache](https://dev.mysql.com/doc/refman/8.4/en/statement-caching.html), [MySQL: optimization khi EXECUTE](https://dev.mysql.com/blog-archive/re-factoring-some-internals-of-prepared-statements-in-5-7/).
+**MySQL:** cache cấu trúc prepared statement không đồng nghĩa tái sử dụng plan theo kiểu parameter sniffing của SQL Server. MySQL lặp bước optimize khi `EXECUTE`; cập nhật statistics khi cần, nhưng chẩn đoán theo engine thực tế. [Prepared statement cache](https://dev.mysql.com/doc/refman/8.4/en/statement-caching.html), [MySQL: optimization khi EXECUTE](https://dev.mysql.com/blog-archive/re-factoring-some-internals-of-prepared-statements-in-5-7/).
 
 ### Tạo và bảo trì index: Giảm thời gian chặn ghi
 
-Online/concurrent không có nghĩa “không khóa”: DDL vẫn có thể cần schema/metadata lock và chờ transaction dài. Ngoài blocking, tính cả CPU, I/O, dung lượng tạm, transaction log/WAL và replication lag.
+Online/concurrent không có nghĩa "không khóa": DDL vẫn có thể cần schema/metadata lock và chờ transaction dài. Ngoài blocking, tính cả CPU, I/O, dung lượng tạm, transaction log/WAL và replication lag.
 
 ```sql
 -- PostgreSQL: ngoài transaction block; REINDEX CONCURRENTLY từ PG 12
 CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status);
 REINDEX INDEX CONCURRENTLY idx_orders_status;
+
+-- Theo dõi tiến trình build index trên PostgreSQL:
+SELECT phase, blocks_done, blocks_total, tuples_done, tuples_total
+FROM pg_stat_progress_create_index;
 
 -- SQL Server: xác minh edition/version, loại index và kiểu cột được hỗ trợ
 CREATE INDEX idx_orders_status ON orders (status) WITH (ONLINE = ON);
@@ -1155,9 +1225,9 @@ ALTER TABLE orders ADD INDEX idx_orders_status (status),
   ALGORITHM=INPLACE, LOCK=NONE;
 ```
 
-PostgreSQL concurrent build thất bại có thể để lại **INVALID index** vẫn tốn chi phí ghi. Kiểm tra pg_index.indisvalid/indisready, xử lý index lỗi rồi mới coi migration hoàn tất. Không chạy CREATE INDEX CONCURRENTLY trong transaction tự động của migration framework; bảng partitioned cần cách build từng partition phù hợp.
-
-SQL Server ONLINE vẫn có schema lock ngắn ở các giai đoạn; WAIT_AT_LOW_PRIORITY/resumable tùy tính năng/phiên bản có thể giúp quản lý rollout. MySQL LOCK=NONE vẫn có metadata lock, và không phải mọi DDL dùng được INPLACE.
+- **PostgreSQL:** concurrent build thất bại có thể để lại **INVALID index** vẫn tốn chi phí ghi — kiểm tra `pg_index.indisvalid` / `indisready`, dọn index lỗi rồi mới coi migration hoàn tất. Không chạy `CREATE INDEX CONCURRENTLY` trong transaction tự động của migration framework; bảng partitioned cần build từng partition phù hợp. Với các DDL cần khóa mạnh (`ALTER TABLE`, `DROP INDEX`, `DETACH PARTITION`), luôn đặt `SET lock_timeout = '2s'` (và retry nếu timeout) để tránh DDL đứng chờ một query dài làm **hàng đợi khóa chặn toàn bộ traffic phía sau**.
+- **SQL Server:** `ONLINE = ON` vẫn cần schema lock ngắn ở đầu/cuối quá trình; `WAIT_AT_LOW_PRIORITY` và resumable index (`RESUMABLE = ON`, theo dõi qua `sys.index_resumable_operations` / `sys.dm_exec_requests`) giúp kiểm soát rollout trên bảng lớn.
+- **MySQL:** `LOCK=NONE` vẫn có metadata lock ngắn, và không phải mọi DDL đều hỗ trợ `ALGORITHM=INPLACE`.
 
 [PostgreSQL CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html), [SQL Server CREATE INDEX](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-index-transact-sql?view=sql-server-ver17), [InnoDB online DDL](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html).
 
@@ -1171,9 +1241,9 @@ WHERE shop_id = 42
   AND EXTRACT(YEAR FROM created_at) = 2024;  -- không SARGable
 ```
 
-Access path có thể định vị shop_id=42 rồi lọc năm trên từng entry/row, khiến shop lớn đọc rất nhiều dù trả ít. PostgreSQL hiển thị Index Scan, SQL Server tương tự là Index Seek với YEAR(created_at) ở residual filter. Viết lại range hoặc dùng expression/computed index phù hợp.
+Access path có thể định vị `shop_id = 42` rồi lọc năm trên từng entry/row, khiến shop lớn đọc rất nhiều dù trả ít. PostgreSQL hiển thị `Index Scan`, SQL Server tương tự là `Index Seek` với `YEAR(created_at)` ở residual predicate. Viết lại range hoặc dùng expression/computed index phù hợp.
 
-SQL Server: phân biệt Seek Predicates và residual Predicate, đối chiếu Rows Read. PostgreSQL: phân biệt Index Cond, Filter, Rows Removed by Filter; điều kiện ở cột sau range có thể thuộc Index Cond nhưng vẫn đọc nhiều entry. Recheck Cond còn phục vụ bitmap/lossy recheck, không đồng nghĩa residual filter.
+SQL Server: phân biệt `Seek Predicates` và residual `Predicate`, đối chiếu `Rows Read`. PostgreSQL: phân biệt `Index Cond`, `Filter`, `Rows Removed by Filter`; điều kiện ở cột sau range có thể thuộc `Index Cond` nhưng vẫn đọc nhiều entry. `Recheck Cond` còn phục vụ bitmap/lossy recheck, không đồng nghĩa residual filter. MySQL: `Extra: Using index condition` (ICP) cho biết residual predicate được lọc ngay trên leaf index trước khi lookup bảng.
 
 ### Key Lookup / heap fetch: Khi Seek thua Scan
 
@@ -1201,7 +1271,7 @@ WHERE status = 'open';   -- PostgreSQL partial / SQL Server filtered
 | `WHERE created_at > …` (không ghi status) | Không |
 | `WHERE status = @status` (SQL Server parameter) | **Thường không** — optimizer không dám giả định `@status` luôn `'open'` |
 
-SQL Server có thể thử literal nghiệp vụ cố định hoặc OPTION(RECOMPILE); dynamic SQL vẫn parameterize input người dùng. PostgreSQL custom plan có thể nhận ra parameter đã biết, generic plan không được giả định giá trị đó. Predicate status IN('open','paused') không thể được phục vụ đầy đủ bằng riêng index chỉ chứa open.
+SQL Server có thể thử literal nghiệp vụ cố định hoặc `OPTION (RECOMPILE)`; dynamic SQL vẫn parameterize input người dùng. PostgreSQL custom plan có thể nhận ra parameter đã biết, generic plan không được giả định giá trị đó. Predicate `status IN ('open', 'paused')` không thể được phục vụ đầy đủ bằng riêng index chỉ chứa `'open'`.
 
 ### Thống kê lệch và cột tương quan
 
@@ -1240,7 +1310,7 @@ SELECT * FROM users WHERE LOWER(email) = 'a@b.com';
 -- hoặc WHERE LOWER(email) = ... + index (LOWER(email))
 ```
 
-SQL Server indexed view được engine duy trì khi DML và có yêu cầu schema/SET options. PostgreSQL MATERIALIZED VIEW lưu kết quả và cần REFRESH theo chiến lược ứng dụng. Chúng khác view thường và khác nhau về độ mới/chi phí ghi.
+SQL Server **indexed view** được engine duy trì khi DML và có yêu cầu nghiêm ngặt về schema/`SET` options; lưu ý trên **SQL Server Standard Edition**, optimizer **không tự động dùng** indexed view cho query trên bảng gốc trừ khi query tham chiếu thẳng view kèm hint `WITH (NOEXPAND)`. PostgreSQL `MATERIALIZED VIEW` lưu kết quả và cần `REFRESH` theo chiến lược ứng dụng. Chúng khác view thường và khác nhau về độ mới/chi phí ghi.
 
 ## Phần 6. Cạm bẫy và mẹo nâng cao về Indexing
 
@@ -1397,7 +1467,7 @@ INCLUDE (price);
 
 INCLUDE chứa payload ở leaf, không cung cấp seek/order và không tham gia UNIQUE. Cột INCLUDE vẫn có thể dùng cho residual filter nếu engine chọn; cột cần định vị/giữ thứ tự mới phải là key. MySQL không có INCLUDE, thêm payload vào key làm cây rộng hơn. Tránh index covering mọi cột theo SELECT *; đo dung lượng và chi phí ghi.
 
-PostgreSQL Index Only Scan vẫn có Heap Fetches khi page chưa all-visible. Kiểm tra autovacuum, churn và transaction dài giữ snapshot; VACUUM không luôn đạt heap fetch=0 trên bảng đang ghi liên tục. SQL Server đủ cột thường tránh Key Lookup để lấy dữ liệu. [Index-only scans và visibility map](https://www.postgresql.org/docs/18/indexes-index-only-scans.html).
+PostgreSQL `Index Only Scan` vẫn có `Heap Fetches` khi page chưa all-visible. Kiểm tra autovacuum, churn và transaction dài giữ snapshot; `VACUUM` không luôn đạt `Heap Fetches = 0` trên bảng đang ghi liên tục. SQL Server đủ cột thường tránh `Key Lookup` để lấy dữ liệu. [Index-only scans và visibility map](https://www.postgresql.org/docs/18/indexes-index-only-scans.html).
 
 ### Lọc và sắp xếp khi JOIN: Tối ưu trước khi denormalize
 
@@ -1478,7 +1548,9 @@ ON orders (customer_id, shipment_id)
 WHERE shipment_id IS NOT NULL;
 
 -- Nếu chỉ cần “mỗi khách tối đa một đơn chưa giao”, dùng index riêng:
--- PostgreSQL / SQL Server; SQL Server INCLUDE tránh hạn chế IS NULL đã biết.
+-- PostgreSQL / SQL Server; trên SQL Server, INCLUDE (shipment_id) giúp Query Optimizer
+-- chọn dùng index cho SELECT ... WHERE shipment_id IS NULL (còn việc enforce UNIQUE
+-- vẫn hoạt động kể cả không có INCLUDE).
 CREATE UNIQUE INDEX orders_one_pending
 ON orders (customer_id) INCLUDE (shipment_id)
 WHERE shipment_id IS NULL;
@@ -1600,12 +1672,14 @@ SELECT * FROM articles
 WHERE to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(body, ''))
   @@ plainto_tsquery('simple', 'indexing btree');
 
--- SQL Server: Full-Text (không phải B-tree)
+-- SQL Server: Full-Text (tìm theo token/từ — hỗ trợ prefix '"nguyen*"',
+-- KHÔNG hỗ trợ leading wildcard '"*nguyen"' như pg_trgm)
 -- CREATE FULLTEXT CATALOG ft AS DEFAULT;
 -- CREATE FULLTEXT INDEX ON users(name) KEY INDEX pk_users;
 SELECT * FROM users WHERE CONTAINS(name, '"nguyen"');
 
--- MySQL: FULLTEXT theo token; muốn ngram phải chọn parser riêng, không có trong ví dụ này
+-- MySQL: FULLTEXT theo token; muốn substring cần khai báo WITH PARSER ngram
+-- (và chú ý biến hệ thống ngram_token_size), không có trong ví dụ mặc định dưới đây:
 ALTER TABLE users ADD FULLTEXT INDEX users_name_ft (name);
 SELECT * FROM users WHERE MATCH(name) AGAINST ('nguyen' IN BOOLEAN MODE);
 ```
@@ -1658,14 +1732,37 @@ ALTER INDEX users_email_idx ON users REORGANIZE;           -- nhẹ
 ALTER INDEX users_email_idx ON users REBUILD WITH (ONLINE = ON);  -- Enterprise / một số edition
 ```
 
-Chỉ rebuild/reorganize khi số liệu cho thấy lợi ích đủ bù chi phí I/O, log và blocking. Page density thấp còn ảnh hưởng cache/độ sâu, kể cả lookup. Không dùng ngưỡng fragmentation cố định cho mọi index; nhiều trường hợp cải thiện sau rebuild thực chất đến từ statistics mới. Fillfactor thấp hơn có thể giảm split nhưng tăng số page. [SQL Server: bảo trì theo workload và page density](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/reorganize-and-rebuild-indexes?view=sql-server-ver17).
+Chỉ rebuild/reorganize khi số liệu cho thấy lợi ích đủ bù chi phí I/O, log và blocking. Page density thấp còn ảnh hưởng cache/độ sâu, kể cả lookup. Không dùng ngưỡng fragmentation cố định cho mọi index; nhiều trường hợp cải thiện sau rebuild thực chất đến từ statistics mới. `fillfactor` thấp hơn có thể giảm split nhưng tăng số page.
+
+**Cải tiến chống phình B-tree ở PostgreSQL hiện đại:**
+
+- **B-tree Deduplication (PG 13+):** nén các TID có cùng giá trị key thành một posting list, giúp index trên cột lặp nhiều (`tenant_id`, `status`) nhỏ hơn đáng kể so với trước đây.
+- **Bottom-up Index Deletion (PG 14+):** trước khi split một leaf page sắp đầy, PostgreSQL chủ động dọn các index entry trỏ đến tuple version đã chết — giảm mạnh bloat index khi `UPDATE` các cột *không* nằm trong index nhưng không đạt điều kiện HOT.
+
+[SQL Server: bảo trì theo workload và page density](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/reorganize-and-rebuild-indexes?view=sql-server-ver17), [PostgreSQL: B-tree deduplication](https://www.postgresql.org/docs/18/btree.html#BTREE-DEDUPLICATION).
 
 ## Phần 7. Kỹ thuật thao tác dữ liệu hiệu quả
 
 
+### Locking & Deadlock do Index: Gap Lock, Next-Key Lock và Key-Range Lock
+
+Index không chỉ ảnh hưởng tốc độ đọc — nó quyết định **phạm vi khóa** khi `UPDATE`, `DELETE`, hoặc `SELECT ... FOR UPDATE`. Nhiều sự cố blocking và deadlock trên production xuất phát trực tiếp từ thiếu index hoặc chọn sai loại index:
+
+- **MySQL / InnoDB (mặc định `REPEATABLE READ`):**
+  - **Thiếu index trên cột `WHERE`:** InnoDB phải scan cả bảng (clustered index) và đặt **next-key lock** (khóa bản ghi + khoảng trống kế cận) lên **mọi dòng quét qua** → có thể khóa gần như cả bảng chỉ vì một câu `UPDATE` 1 dòng!
+  - **Unique index tìm đúng 1 dòng tồn tại:** chỉ đặt **record lock** trên dòng đó (không gap lock).
+  - **Non-unique index hoặc tìm không thấy dòng:** InnoDB đặt **gap lock / next-key lock** trên khoảng kề để chặn phantom read → hai transaction cập nhật hoặc `INSERT` vào cùng khoảng trống giữa các key dễ gây **deadlock** bất ngờ dù không đụng cùng một dòng.
+- **SQL Server:**
+  - `UPDATE`/`DELETE` quét qua bảng hoặc index rộng có thể giữ nhiều khóa và kích hoạt **lock escalation** lên khóa cả bảng (`TABLE` lock).
+  - Dưới `SERIALIZABLE` (hoặc `WITH (HOLDLOCK)`), SQL Server dùng **key-range lock** (`RangeS-U`, `RangeX-X`) trên B-tree — có thể block cả các giá trị lân cận chưa tồn tại.
+- **PostgreSQL:**
+  - MVCC không dùng gap lock vật lý cho `READ COMMITTED` / `REPEATABLE READ` thông thường (tránh kiểu deadlock gap lock của InnoDB), nhưng vẫn khóa dòng trên các tuple mục tiêu và khóa nặng hơn dưới `SERIALIZABLE` (SSI — predicate lock có thể gây serialization failure cần retry). Thiếu index trên FK phía child cũng làm tăng thời gian giữ khóa khi xóa/sửa parent.
+
+**Quy tắc thực hành:** luôn đảm bảo `UPDATE`/`DELETE`/`FOR UPDATE` đi qua index chọn lọc (tốt nhất là PK/UNIQUE nếu tác động 1 dòng), khóa nhiều bảng theo **cùng một thứ tự cố định**, giữ transaction ngắn và luôn có cơ chế retry cho deadlock/serialization failure.
+
 ### Tranh chấp khóa: Khi bộ đếm bị "nghẽn cổ chai"
 
-Khi đo thấy một counter row là điểm tranh chấp, có thể phân tán thành nhiều bucket để update song song. Giả định PK/UNIQUE(post_id, fanout), likes_count kiểu BIGINT NOT NULL; số bucket phải được đo và tổng đọc sẽ tốn hơn. Retry cần idempotency để tránh cộng hai lần.
+Khi đo thấy một counter row là điểm tranh chấp, có thể phân tán thành nhiều bucket để update song song. Giả định `PK/UNIQUE (post_id, fanout)`, `likes_count` kiểu `BIGINT NOT NULL`; số bucket phải được đo và tổng đọc sẽ tốn hơn. Retry cần idempotency để tránh cộng hai lần.
 
 ```sql
 -- MySQL 8.0.19+ có row alias; VALUES() trong update deprecated từ 8.0.20
@@ -1685,26 +1782,26 @@ USING (SELECT CAST(1475870220422107137 AS bigint) AS post_id,
               ABS(CAST(CHECKSUM(NEWID()) AS bigint)) % 100 AS fanout,
               1 AS likes_count) AS s
 ON t.post_id = s.post_id AND t.fanout = s.fanout
-WHEN MATCHED THEN UPDATE SET likes_count = t.likes_count + 1
+WHEN MATCHED THEN UPDATE SET likes_count = t.likes_count + s.likes_count
 WHEN NOT MATCHED THEN INSERT (post_id, fanout, likes_count) VALUES (s.post_id, s.fanout, s.likes_count);
 
 SELECT SUM(likes_count) FROM post_statistics WHERE post_id = 1475870220422107137;
 ```
 
-SQL Server: cast trước ABS tránh overflow của INT_MIN. MERGE vẫn cần kiểm chứng concurrency/deadlock; xem mẫu transaction UPDATE/INSERT ở mục UPSERT. Không coi fanout là cách chữa mọi lock wait.
+SQL Server: cast sang `BIGINT` trước `ABS` tránh overflow của `INT_MIN`. Lưu ý khi các bucket `0..99` chưa tồn tại, `MERGE ... WITH (HOLDLOCK)` (tức `SERIALIZABLE` key-range lock) có thể gây blocking/deadlock giữa các bucket kề nhau; trên tải ghi cao, **khởi tạo sẵn (pre-seed) N bucket** khi tạo post rồi chỉ chạy `UPDATE` đơn thuần (không cần `MERGE`/`HOLDLOCK`) thường ít tranh chấp hơn. Xem thêm mẫu transaction `UPDATE`/`INSERT` ở mục UPSERT. Không coi fanout là cách chữa mọi lock wait.
 
 
 ### Cập nhật dữ liệu từ bảng khác: JOIN trong UPDATE
 
-Giả định categories.category_id là UNIQUE/PK, mỗi product match tối đa một source row. Nếu JOIN trả nhiều source cho một target, giá trị cập nhật có thể không xác định; aggregate hoặc loại trùng source theo quy tắc rõ ràng trước.
+Giả định `categories.category_id` là `UNIQUE`/`PK`, mỗi product match tối đa một source row. Nếu `JOIN` trả nhiều source cho một target, giá trị cập nhật có thể không xác định; aggregate hoặc loại trùng source theo quy tắc rõ ràng trước.
 
 ```sql
--- MySQL
+-- MySQL (lưu ý: multi-table UPDATE trong MySQL không hỗ trợ ORDER BY / LIMIT)
 UPDATE products
 JOIN categories USING (category_id)
-SET price = price_base - price_base * categories.discount;
+SET products.price = products.price_base - products.price_base * categories.discount;
 
--- PostgreSQL
+-- PostgreSQL (PG 15+ cũng hỗ trợ MERGE chuẩn SQL)
 UPDATE products
 SET price = price_base - price_base * categories.discount
 FROM categories
@@ -1712,7 +1809,7 @@ WHERE products.category_id = categories.category_id;
 
 -- SQL Server
 UPDATE p
-SET price = price_base - price_base * c.discount
+SET price = p.price_base - p.price_base * c.discount
 FROM products p
 JOIN categories c ON p.category_id = c.category_id;
 ```
@@ -1918,13 +2015,13 @@ UPDATE account SET balance = 540 WHERE account_id = 7;
 COMMIT;
 ```
 
-FOR UPDATE/UPDLOCK giữ khóa đến hết transaction. Index account_id giảm công việc tìm và phạm vi khóa; engine vẫn có thể dùng key/page/table/gap locks tùy isolation và lock escalation. Khóa theo cùng thứ tự, giữ transaction ngắn, retry deadlock có kiểm soát.
+`FOR UPDATE` / `UPDLOCK` giữ khóa đến hết transaction. Index trên `account_id` giảm công việc tìm và phạm vi khóa; engine vẫn có thể dùng key/page/table/gap locks tùy isolation và lock escalation. Khóa theo cùng thứ tự, giữ transaction ngắn, retry deadlock có kiểm soát.
 
-Nếu chỉ trừ tiền, thường dùng một statement atomic: UPDATE account SET balance=balance-@amount WHERE account_id=@id AND balance>=@amount, rồi kiểm tra row count. Trường hợp đọc-tính-ghi từ app còn có thể dùng optimistic concurrency/version token. Lock không thay kiểm tra nghiệp vụ.
+Nếu chỉ trừ tiền, thường dùng một statement atomic: `UPDATE account SET balance = balance - @amount WHERE account_id = @id AND balance >= @amount`, rồi kiểm tra row count. Trường hợp đọc–tính–ghi từ app còn có thể dùng optimistic concurrency / version token. Lock không thay kiểm tra nghiệp vụ.
 
 ### SKIP LOCKED: Claim công việc trong transaction ngắn
 
-SKIP LOCKED/READPAST giúp worker bỏ qua row đang khóa. Phải **đổi trạng thái claim trong cùng transaction**, rồi commit trước khi xử lý tác vụ dài; SELECT rồi COMMIT mà vẫn để pending có thể giao cùng job cho worker kế tiếp.
+`SKIP LOCKED` / `READPAST` giúp worker bỏ qua row đang khóa. Phải **đổi trạng thái claim trong cùng transaction**, rồi commit trước khi xử lý tác vụ dài; `SELECT` rồi `COMMIT` mà vẫn để `pending` có thể giao cùng job cho worker kế tiếp.
 
 ```sql
 -- PostgreSQL: một statement atomic; mặc định autocommit khi không có transaction ngoài
@@ -1942,8 +2039,8 @@ FROM claim
 WHERE j.id = claim.id
 RETURNING j.id, j.payload;
 
--- SQL Server: READ COMMITTED, dùng locking cả khi database bật RCSI.
--- READCOMMITTEDLOCK và ROWLOCK thuộc cùng nhóm hint, không ghép cả hai.
+-- SQL Server: READ COMMITTED, dùng locking kể cả khi database bật RCSI.
+-- Lưu ý: READCOMMITTEDLOCK và ROWLOCK thuộc cùng nhóm granularity hint nên không ghép cả hai.
 ;WITH claim AS (
   SELECT TOP (1) id, payload, status
   FROM job_queue WITH (UPDLOCK, READPAST, READCOMMITTEDLOCK)
@@ -1953,23 +2050,25 @@ RETURNING j.id, j.payload;
 UPDATE claim SET status = 'processing'
 OUTPUT inserted.id, inserted.payload;
 
--- MySQL/InnoDB 8.0: giữ transaction trong bước chọn + đổi trạng thái
+-- MySQL/InnoDB 8.0+: giữ transaction trong bước chọn + đổi trạng thái.
+-- Trong code ứng dụng: SELECT id, payload ... FOR UPDATE SKIP LOCKED trước;
+-- chỉ chạy UPDATE nếu thực sự có dòng trả về (tránh chạy thừa khi queue rỗng).
 START TRANSACTION;
-SET @job_id = NULL;
-SELECT id INTO @job_id
+SELECT id, payload
 FROM job_queue
 WHERE status = 'pending'
 ORDER BY id
 LIMIT 1
 FOR UPDATE SKIP LOCKED;
+-- (Ứng dụng đọc @job_id, @payload; nếu có dòng:)
 UPDATE job_queue SET status = 'processing' WHERE id = @job_id;
-SELECT id, payload FROM job_queue WHERE id = @job_id;
 COMMIT;
 ```
 
-Giả định id là PK; index (status, id) hoặc partial/filtered pending phù hợp. Chỉ xử lý payload sau khi biết claim đã commit; nếu có transaction ngoài thì phải chờ commit ngoài. SQL Server READPAST không bỏ page lock, và vẫn có thể block ở FK/index/metadata; ROWLOCK cũng không bảo đảm không escalation.
+Giả định `id` là PK; index `(status, id)` hoặc partial/filtered `WHERE status = 'pending'` phù hợp. Chỉ xử lý payload sau khi biết claim đã commit; nếu có transaction ngoài thì phải chờ commit ngoài.
 
-Production cần thêm lease/locked_until, claim token và retry khi worker chết; UPDATE hoàn tất phải kiểm tra token để worker cũ không ghi đè claim mới. Side effect cần idempotency. SKIP LOCKED không bảo đảm FIFO tuyệt đối hay exactly-once và không dùng cho báo cáo cần đọc đủ row. [PostgreSQL locking clause](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE), [SQL Server READPAST và RCSI](https://learn.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table?view=sql-server-ver17#readpast).
+- **SQL Server trade-off (`READCOMMITTEDLOCK` vs `ROWLOCK`):** `UPDLOCK` trên câu `UPDATE` vốn đã bỏ qua row versioning của RCSI cho các dòng mục tiêu; `READCOMMITTEDLOCK` đảm bảo cả các lượt đọc/probe phụ không đọc snapshot cũ, nhưng vì không ghép được với `ROWLOCK` nên SQL Server có thể lấy **page lock** trên queue nhỏ/nóng (mà `READPAST` không bỏ qua page lock). Đo thực tế trên concurrency của bạn để chọn `(UPDLOCK, READPAST, ROWLOCK)` hay `(UPDLOCK, READPAST, READCOMMITTEDLOCK)`. `ROWLOCK` cũng không bảo đảm chống lock escalation, và `READPAST` vẫn có thể bị block ở FK/index/metadata.
+- **Production:** cần thêm `lease` / `locked_until`, claim token và cơ chế thu hồi khi worker chết; câu `UPDATE` hoàn tất phải kiểm tra claim token để worker cũ không ghi đè claim mới. Side effect cần idempotency. `SKIP LOCKED` không bảo đảm FIFO tuyệt đối hay exactly-once và không dùng cho báo cáo cần đọc đủ row. [PostgreSQL locking clause](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE), [SQL Server READPAST và RCSI](https://learn.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table?view=sql-server-ver17#readpast).
 
 ### EXISTS và NOT EXISTS: Semi-join / anti-join
 
@@ -1994,7 +2093,7 @@ WHERE NOT EXISTS (
 );
 ```
 
-EXISTS diễn đạt ý định tốt hơn COUNT(*)>0; optimizer có thể biến đổi cả hai trong một số trường hợp. Semi/anti join có thể dùng nested loop, hash hoặc merge. Hash đọc nhiều orders có thể hợp lý khi tập khách lớn, không tự chứng minh thiếu index.
+`EXISTS` diễn đạt ý định tốt hơn `COUNT(*) > 0`; optimizer có thể biến đổi cả hai trong một số trường hợp. Semi/anti join có thể dùng nested loop, hash hoặc merge. Hash đọc nhiều `orders` có thể hợp lý khi tập khách lớn, không tự chứng minh thiếu index.
 
 ### LATERAL / CROSS APPLY: Top-N mỗi nhóm
 
@@ -2159,7 +2258,9 @@ ORM/`foreach` khách rồi `SELECT * FROM orders WHERE customer_id = @id` = N+1 
 -- 1 round-trip: IN / JOIN / LATERAL (Phần 8 trên)
 SELECT * FROM orders
 WHERE customer_id = ANY(@ids);          -- PostgreSQL
--- SQL Server: WHERE customer_id IN (SELECT id FROM @ids)
+-- SQL Server: TVP (@ids) hoặc OPENJSON (SQL Server 2016+ / EF Core 8+):
+-- WHERE customer_id IN (SELECT id FROM @ids)   -- TVP không có histogram; cân nhắc OPTION (RECOMPILE) nếu danh sách biến động lớn
+-- WHERE customer_id IN (SELECT CAST([value] AS bigint) FROM OPENJSON(@ids_json))
 
 -- Chi tiết sau khi có id: hai bước (covering hẹp rồi hydrate)
 SELECT id FROM orders WHERE customer_id = @c AND created_at >= @from
@@ -2167,7 +2268,7 @@ ORDER BY created_at DESC, id DESC LIMIT 50;
 SELECT * FROM orders WHERE id = ANY(@page_ids);
 ```
 
-Bước 1 có thể dùng index (customer_id, created_at DESC, id DESC); INCLUDE payload theo nhu cầu. Bước 2 lấy theo ID **không giữ thứ tự trang** nếu thiếu ORDER BY/ordinal: ứng dụng phải ghép lại đúng thứ tự. Hai query cũng có thể thấy dữ liệu khác nhau khi update/delete giữa hai lượt; dùng isolation phù hợp nếu cần nhất quán. Với chỉ 50 row, một SELECT trực tiếp + lookup thường đã đủ tốt, nên đo trước khi tách hai bước.
+Bước 1 có thể dùng index `(customer_id, created_at DESC, id DESC)`; `INCLUDE` payload theo nhu cầu. Bước 2 lấy theo ID **không giữ thứ tự trang** nếu thiếu `ORDER BY`/ordinal: ứng dụng phải ghép lại đúng thứ tự. Hai query cũng có thể thấy dữ liệu khác nhau khi update/delete giữa hai lượt; dùng isolation phù hợp nếu cần nhất quán. Với chỉ 50 row, một `SELECT` trực tiếp + lookup thường đã đủ tốt, nên đo trước khi tách hai bước.
 
 ### Optional filter: `OR col IS NULL` / `@p IS NULL OR col = @p`
 
@@ -2185,9 +2286,9 @@ SQL Server hay scan; PostgreSQL generic plan cũng dễ bỏ index. Cách làm:
 2. SQL Server: `OPTION (RECOMPILE)` cho báo cáo thưa (compile mỗi lần).
 3. Hai query: “có filter” vs “không filter”, không nhét một câu catch-all.
 
-SQL Server 2025 với compatibility level 170 và OPTIONAL_PARAMETER_OPTIMIZATION bật có **OPPO** cho các optional predicate đủ điều kiện: có thể tách plan khi parameter NULL/non-NULL. PSP và OPPO giải quyết các tình huống khác nhau; xác minh query có được tối ưu không. Dynamic SQL cần parameterize giá trị, chỉ ghép cấu trúc đã kiểm soát. [OPPO](https://learn.microsoft.com/en-us/sql/relational-databases/performance/optional-parameter-optimization?view=sql-server-ver17).
+SQL Server 2025 với compatibility level 170 và `OPTIONAL_PARAMETER_OPTIMIZATION` bật có **OPPO** cho các optional predicate đủ điều kiện: có thể tách plan khi parameter `NULL`/non-`NULL`. PSP và OPPO giải quyết các tình huống khác nhau; xác minh query có được tối ưu không. Dynamic SQL cần parameterize giá trị, chỉ ghép cấu trúc đã kiểm soát. [OPPO](https://learn.microsoft.com/en-us/sql/relational-databases/performance/optional-parameter-optimization?view=sql-server-ver17).
 
-COALESCE(@status,status)=status không luôn tương đương catch-all: khi @status NULL, row status NULL có NULL=NULL (UNKNOWN) nên bị loại. Không đổi dạng chỉ vì nghĩ nhanh hơn.
+`COALESCE(@status, status) = status` không luôn tương đương catch-all: khi `@status` là `NULL`, row có `status IS NULL` cho ra `NULL = NULL` (`UNKNOWN`) nên bị loại. Không đổi dạng chỉ vì nghĩ nhanh hơn.
 
 ### LEFT JOIN … IS NULL: Anti-join dễ viết sai
 
@@ -2223,7 +2324,7 @@ WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00+07'
   AND created_at <  TIMESTAMPTZ '2024-02-01 00:00+07'
 ```
 
-Keyset theo thời gian cần cursor (created_at,id) và comparator theo chiều ORDER BY. OFFSET không mặc nhiên sai; nó đắt khi sâu và có thể lệch khi dữ liệu đổi giữa các request. Ưu tiên range trực tiếp thay hàm trên cột; một số cast SQL Server có dynamic seek nên vẫn cần xem plan. Timezone: Phần 9.
+Keyset theo thời gian cần cursor `(created_at, id)` và comparator theo chiều `ORDER BY`. `OFFSET` không mặc nhiên sai; nó đắt khi sâu và có thể lệch khi dữ liệu đổi giữa các request. Ưu tiên range trực tiếp thay hàm trên cột; một số cast SQL Server có dynamic seek nên vẫn cần xem plan. Timezone: Phần 9.
 
 ## Phần 9. Thiết kế Schema: Nền móng vững chắc
 
@@ -2259,7 +2360,7 @@ CREATE UNIQUE INDEX users_uuid ON users (uuid);
 
 DEFAULT/backfill khi thêm cột lên bảng lớn có thể tốn thời gian và khóa; cân nhắc migration theo giai đoạn. NEWSEQUENTIALID chỉ gọi trong DEFAULT, có đặc điểm suy đoán và restart/failover riêng. [UUID PostgreSQL 18](https://www.postgresql.org/docs/18/functions-uuid.html), [NEWSEQUENTIALID](https://learn.microsoft.com/en-us/sql/t-sql/functions/newsequentialid-transact-sql?view=sql-server-ver17).
 
-UUID_TO_BIN(...,1) dành cho cách bố trí thời gian của UUIDv1; đổi swap flag khi lưu/đọc sẽ làm sai giá trị UUID. [MySQL UUID_TO_BIN](https://dev.mysql.com/doc/refman/8.4/en/miscellaneous-functions.html#function_uuid-to-bin).
+`UUID_TO_BIN(..., 1)` dành cho cách bố trí thời gian của UUIDv1; đổi `swap_flag` khi lưu/đọc sẽ làm sai giá trị UUID. [MySQL UUID_TO_BIN](https://dev.mysql.com/doc/refman/8.4/en/miscellaneous-functions.html#function_uuid-to-bin).
 
 ### JSON Column: Khi NoSQL gặp SQL
 
@@ -2345,20 +2446,24 @@ Partition giúp retention theo một tập row đã tách sẵn và partition pr
 -- MySQL
 ALTER TABLE logs DROP PARTITION logs_2023_january;
 
--- PostgreSQL
-DROP TABLE logs_2023_january;  -- hoặc DETACH PARTITION rồi DROP
+-- PostgreSQL (nên đặt SET lock_timeout trước khi DROP / DETACH để tránh hàng đợi khóa)
+DROP TABLE logs_2023_january;  -- hoặc DETACH PARTITION [CONCURRENTLY] rồi DROP
 
--- SQL Server
-TRUNCATE TABLE logs WITH (PARTITIONS (1));  -- cần index alignment và điều kiện hỗ trợ
+-- SQL Server 2016+: cần index alignment và điều kiện hỗ trợ;
+-- hoặc ALTER TABLE logs SWITCH PARTITION 1 TO logs_staging để archive rồi DROP
+TRUNCATE TABLE logs WITH (PARTITIONS (1));
 ```
 
-PostgreSQL DROP partition trực tiếp có thể cần khóa mạnh trên parent; DETACH PARTITION CONCURRENTLY có điều kiện và không chạy trong transaction block. PK/UNIQUE trên bảng partitioned PostgreSQL phải bao gồm partition key; MySQL cũng có hạn chế unique key với partition expression. SQL Server SWITCH cần schema/index/constraint tương thích. Xác minh toàn bộ dữ liệu trong partition đã hết retention, không chỉ tên partition. [PostgreSQL partitioning](https://www.postgresql.org/docs/18/ddl-partitioning.html).
+PostgreSQL `DROP` partition trực tiếp có thể cần khóa mạnh (`ACCESS EXCLUSIVE`) trên bảng parent; `DETACH PARTITION CONCURRENTLY` có điều kiện và không chạy trong transaction block — nên đặt `SET lock_timeout` khi chạy DDL trên production. `PK`/`UNIQUE` trên bảng partitioned PostgreSQL phải bao gồm partition key; MySQL cũng có hạn chế unique key với partition expression. SQL Server `SWITCH` cần schema/index/constraint tương thích. Xác minh toàn bộ dữ liệu trong partition đã hết retention, không chỉ tên partition. [PostgreSQL partitioning](https://www.postgresql.org/docs/18/ddl-partitioning.html).
 
 
 ### Bảng sắp xếp trước: Tối ưu cho quét phạm vi
 
 ```sql
--- MySQL: composite PK để sắp xếp vật lý
+-- MySQL/InnoDB: composite PK để sắp xếp vật lý theo (product_id, comment_id).
+-- Lưu ý: InnoDB bắt buộc cột AUTO_INCREMENT phải đứng đầu ít nhất MỘT index
+-- (bỏ UNIQUE KEY ở comment_id sẽ gặp ERROR 1075). Đổi lại bảng có thêm
+-- 1 secondary index UNIQUE(comment_id) mang theo composite PK ở leaf.
 CREATE TABLE product_comments (
   product_id BIGINT,
   comment_id BIGINT AUTO_INCREMENT UNIQUE KEY,
@@ -2414,11 +2519,11 @@ INCLUDE (deleted_at)
 WHERE deleted_at IS NULL;
 ```
 
-Query phải có predicate để optimizer chứng minh chỉ cần row active. SQL Server có hạn chế đã biết với filtered IS NULL khi cột kiểm tra không nằm trong index, nên ví dụ INCLUDE(deleted_at). [Microsoft: filtered IS NULL index](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/filtered-index-with-column-is-null).
+Query phải có predicate để optimizer chứng minh chỉ cần row active. SQL Server có hạn chế đã biết với filtered `IS NULL` khi cột kiểm tra không nằm trong index, nên ví dụ thêm `INCLUDE (deleted_at)`. [Microsoft: filtered IS NULL index](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/filtered-index-with-column-is-null).
 
-Unique(email) WHERE deleted_at IS NULL cho phép tái dùng email đã xóa mềm. Với multi-tenant, unique key thường là (tenant_id,email). MySQL không có filtered index: một phương án là generated active_email = CASE WHEN deleted_at IS NULL THEN email ELSE NULL END rồi UNIQUE(tenant_id,active_email), với email active NOT NULL và collation đúng yêu cầu. Restore có thể thất bại nếu email đã được tái dùng.
+`UNIQUE (email) WHERE deleted_at IS NULL` cho phép tái dùng email đã xóa mềm. Với multi-tenant, unique key thường là `(tenant_id, email)`. MySQL không có filtered index: một phương án là generated column `active_email = CASE WHEN deleted_at IS NULL THEN email ELSE NULL END` rồi `UNIQUE (tenant_id, active_email)`, với email active `NOT NULL` và collation đúng yêu cầu. Restore có thể thất bại nếu email đã được tái dùng.
 
-Thay deleted_at làm thay đổi membership của partial index, nên vẫn có chi phí ghi và ảnh hưởng HOT PostgreSQL; không né chi phí đó chỉ bằng việc để nó ngoài key.
+Thay `deleted_at` làm thay đổi membership của partial index, nên vẫn có chi phí ghi và ảnh hưởng HOT PostgreSQL; không né chi phí đó chỉ bằng việc để nó ngoài key.
 
 ### Khóa clustered hẹp: Đừng nhét UUID vào mọi secondary
 
@@ -2465,7 +2570,7 @@ Thiếu tenant prefix có thể làm đọc nhiều rồi filter, nhưng nếu c
 - **Lookup table** (`status_id` FK): thêm trạng thái không `ALTER TYPE`. Index FK (Phần 10). JOIN nhỏ, covering được.
 - **ENUM PostgreSQL**: có thể ADD VALUE trong transaction ở bản hiện đại, nhưng không dùng giá trị mới trước khi transaction commit. Có RENAME VALUE; xóa/sắp lại label thường cần đổi type/migration. MySQL ENUM dùng ordinal cho thứ tự, khác thứ tự từ điển của chuỗi. [PostgreSQL ALTER TYPE](https://www.postgresql.org/docs/18/sql-altertype.html).
 
-Nếu query lấy nhiều cột của một trạng thái rất phổ biến, index status đơn có thể không có lợi. Tuy vậy index hẹp có thể giúp count/group hoặc tìm giá trị hiếm. So với (tenant_id,status,created_at) hoặc partial index theo workload, không chỉ tỷ lệ open toàn bảng.
+Nếu query lấy nhiều cột của một trạng thái rất phổ biến, index `status` đơn có thể không có lợi. Tuy vậy index hẹp có thể giúp count/group hoặc tìm giá trị hiếm. So với `(tenant_id, status, created_at)` hoặc partial index theo workload, không chỉ tỷ lệ `'open'` toàn bảng.
 
 ### Bảng nối nhiều-nhiều: PK kép thay `id` thừa
 
@@ -2509,7 +2614,7 @@ WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00+07'
 
 PostgreSQL TIMESTAMPTZ lưu mốc thời điểm, không giữ tên timezone hay offset gốc; nếu cần lịch theo vùng, lưu thêm zone ID. DATETIMEOFFSET giữ offset, không giữ đầy đủ quy tắc timezone/DST. MySQL TIMESTAMP chuyển theo session time_zone và có giới hạn phạm vi khác DATETIME.
 
-Ngày sinh/ngày hóa đơn dùng DATE; giờ hẹn theo lịch địa phương có thể cần local datetime + zone ID. Tính cận [from,to) trong timezone nghiệp vụ rồi bind tham số đúng kiểu, tránh biến đổi cột đã index. [PostgreSQL date/time types](https://www.postgresql.org/docs/18/datatype-datetime.html).
+Ngày sinh/ngày hóa đơn dùng `DATE`; giờ hẹn theo lịch địa phương có thể cần local datetime + zone ID. Tính cận `[from, to)` trong timezone nghiệp vụ rồi bind tham số đúng kiểu, tránh biến đổi cột đã index. [PostgreSQL date/time types](https://www.postgresql.org/docs/18/datatype-datetime.html).
 
 ## Phần 10. Checklist & lỗ hổng hay quên
 
@@ -2537,7 +2642,7 @@ Muốn lấy payload từ index, các cột cần cho SELECT/join/filter/order p
 
 UPDATE tạo tuple version mới. HOT có thể tránh tạo entry B-tree mới khi không sửa cột được non-summarizing index tham chiếu và tuple mới vừa cùng heap page. Nếu không đủ chỗ, sửa cột ngoài index vẫn có thể phải cập nhật các index. Cột key, INCLUDE, expression và partial predicate đều cần xét.
 
-HOT chain giữ entry index trỏ tới gốc/redirect; ctid của phiên bản mới vẫn có thể đổi. BRIN là summarizing index và có quy tắc ngoại lệ ở bản hỗ trợ. Giảm **heap fillfactor** có thể tạo chỗ cho HOT; giảm index fillfactor không thay việc đó. Theo dõi n_tup_hot_upd/n_tup_upd trong pg_stat_user_tables. [PostgreSQL HOT](https://www.postgresql.org/docs/18/storage-hot.html).
+HOT chain giữ entry index trỏ tới gốc/redirect; `ctid` của phiên bản mới vẫn có thể đổi. BRIN là summarizing index và có quy tắc ngoại lệ ở bản hỗ trợ. Giảm **heap `fillfactor`** có thể tạo chỗ cho HOT; giảm index `fillfactor` không thay việc đó. Theo dõi `n_tup_hot_upd` / `n_tup_upd` trong `pg_stat_user_tables`. [PostgreSQL HOT](https://www.postgresql.org/docs/18/storage-hot.html).
 
 ### BRIN / columnstore: Chọn theo workload
 
@@ -2547,7 +2652,7 @@ B-tree không phải câu trả lời duy nhất:
 | ---------- | ------- |
 | Bảng lớn, created_at tương quan mạnh với vị trí heap | PostgreSQL BRIN trên created_at; nhỏ nhưng lossy và cần recheck/summarization |
 | Analytics, scan/aggregate nhiều row và ít cột | SQL Server columnstore; xét rowgroup quality, write pattern và maintenance |
-| Equality thuần, không range | PostgreSQL `USING HASH` (PG 10+ đã WAL-safe) — vẫn không thay B-tree cho `ORDER BY` / range |
+| Equality thuần, không range | PostgreSQL `USING HASH` (PG 10+ đã WAL-safe) — **chỉ 1 cột (không composite), không hỗ trợ `UNIQUE`, không hỗ trợ `INCLUDE` / Index-Only Scan**; từ PG 13+ B-tree đã có deduplication nên Hash chỉ đáng cân nhắc khi key rất rộng |
 
 ### Thống kê, histogram, và “index có mà không Seek”
 
@@ -2555,7 +2660,15 @@ Optimizer **đoán** cardinality. Thống kê cũ sau bulk load = plan sai (Ph�
 
 ### Invisible / disable trước khi DROP
 
-INVISIBLE MySQL vẫn duy trì/enforce index. DISABLE SQL Server có thể mất truy cập clustered table hoặc ảnh hưởng constraint, nên không xem là toggle thử nghiệm tương đương. Đổi tên PostgreSQL không vô hiệu hóa index. Counter có thể reset; kiểm tra thời điểm reset và chu kỳ nghiệp vụ, không suy ra index vô dụng chỉ từ idx_scan=0.
+`INVISIBLE` MySQL vẫn duy trì/enforce index. `DISABLE` SQL Server có thể mất truy cập clustered table hoặc ảnh hưởng constraint, nên không xem là toggle thử nghiệm tương đương. Đổi tên PostgreSQL không vô hiệu hóa index. Counter có thể reset; kiểm tra thời điểm reset và chu kỳ nghiệp vụ, không suy ra index vô dụng chỉ từ `idx_scan = 0`.
+
+### Bẫy ORM (EF Core / Dapper): Code sạch nhưng Plan xấu
+
+Code LINQ / ORM đẹp vẫn có thể sinh câu SQL phá index dù bảng đã có đủ index tốt:
+
+- **Implicit conversion từ tham số `NVARCHAR`:** Trong .NET / SQL Server, `string` của EF Core và Dapper mặc định bind thành `NVARCHAR(4000)` hoặc `NVARCHAR(MAX)`. Nếu cột DB là `VARCHAR`, SQL Server phải `CONVERT_IMPLICIT` trên cột và mất Seek (Phần 6). Fix: EF Core cấu hình `.IsUnicode(false)` + `.HasMaxLength(...)` khớp schema; Dapper dùng `DbString { IsAnsi = true, Length = ... }`.
+- **Quên projection (`.Select(...)`) → mất Covering Index:** Query trả nguyên entity `db.Orders.Where(...).ToListAsync()` tương đương `SELECT *` (kéo toàn bộ cột bảng) → luôn dính `Key Lookup` / heap fetch. Muốn tận dụng covering / Index-Only Scan, chỉ `.Select(x => new { x.Id, x.CreatedAt, x.Total })` những cột cần dùng.
+- **`list.Contains(x.Id)` & plan cache bloat:** Truyền danh sách ID biến đổi độ dài có thể sinh hàng loạt SQL khác nhau (`IN (1, 2)`, `IN (1, 2, 3)`...) làm phình plan cache hoặc ước lượng lệch. EF Core 8+ trên SQL Server chuyển sang `OPENJSON(@ids)` và Npgsql trên PostgreSQL chuyển sang `= ANY(@ids)` — luôn kiểm tra SQL thật mà ORM phát ra cùng kiểu tham số (Phần 11).
 
 ### Trước khi CREATE INDEX
 
@@ -2637,9 +2750,9 @@ SELECT pg_size_pretty(pg_relation_size('indexing_demo_orders_search')) AS index_
 Kỳ vọng để kiểm chứng, không phải plan/time cố định:
 
 - Baseline có thể scan rồi top-N sort. Index mới có thể cung cấp equality/range và đúng thứ tự, dừng sau đủ kết quả.
-- Đối chiếu Buffers, Rows Removed by Filter, Sort, actual rows/loops và Heap Fetches. Index Only Scan vẫn phụ thuộc visibility map; không dùng tên operator làm tiêu chí duy nhất.
-- Thử status='done', bỏ LIMIT, lấy thêm cột ngoài index hoặc cập nhật total rồi đo lại. total nằm trong INCLUDE nên thay đổi nó có chi phí duy trì index và ảnh hưởng HOT.
-- Với query pending cố định, thử riêng partial index (tenant_id,created_at DESC,id DESC) INCLUDE(total) WHERE status='pending'. Nó nhỏ hơn nhưng không phục vụ done hoặc generic parameter plan chưa chứng minh predicate.
+- Đối chiếu `Buffers`, `Rows Removed by Filter`, `Sort`, `actual rows`/`loops` và `Heap Fetches`. `Index Only Scan` vẫn phụ thuộc visibility map; không dùng tên operator làm tiêu chí duy nhất.
+- Thử `status = 'done'`, bỏ `LIMIT`, lấy thêm cột ngoài index hoặc cập nhật `total` rồi đo lại. `total` nằm trong `INCLUDE` nên thay đổi nó có chi phí duy trì index và ảnh hưởng HOT.
+- Với query `'pending'` cố định, thử riêng partial index `(tenant_id, created_at DESC, id DESC) INCLUDE (total) WHERE status = 'pending'`. Nó nhỏ hơn nhưng không phục vụ `'done'` hoặc generic parameter plan chưa chứng minh predicate.
 
 ### Các thông tin cần giữ khi bàn giao một index
 
@@ -2715,7 +2828,7 @@ Insert 45 → split
 - **Sequential** (IDENTITY hoặc key có thứ tự theo comparator): thường tập trung ở edge page; engine vẫn cấp page/split khi đầy, và concurrency có thể gây last-page contention.
 - **Random** (UUIDv4): truy cập nhiều leaf, split giữa có thể làm giảm mật độ và locality. Mức ảnh hưởng tùy cache, insert pattern và engine.
 
-SQL Server dm_db_index_operational_stats có leaf_allocation_count/nonleaf_allocation_count, không có cột tên page_split. Đây là chỉ báo allocation/split, không tách rõ mọi loại split; cần Extended Events khi muốn điều tra cụ thể. PostgreSQL pg_stat_all_indexes không trực tiếp đo page split/bloat; cần khảo sát page/size và công cụ như pgstatindex. [SQL Server operational counters](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-db-index-operational-stats-transact-sql?view=sql-server-ver17).
+SQL Server `sys.dm_db_index_operational_stats` có `leaf_allocation_count` / `nonleaf_allocation_count`, không có cột tên `page_split`. Đây là chỉ báo allocation/split, không tách rõ mọi loại split; cần Extended Events khi muốn điều tra cụ thể. PostgreSQL `pg_stat_all_indexes` không trực tiếp đo page split/bloat; cần khảo sát page/size và công cụ như `pgstatindex`. Lưu ý PostgreSQL 13+ có **B-tree deduplication** (nén key trùng) và 14+ có **bottom-up index deletion** (chủ động dọn entry chết trước khi split), giúp giảm đáng kể split/bloat do non-HOT update (xem Phần 6). [SQL Server operational counters](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-db-index-operational-stats-transact-sql?view=sql-server-ver17).
 
 ### Leaf chứa gì: TID (heap) vs clustered key
 
@@ -2746,8 +2859,8 @@ CREATE INDEX orders_created_at ON orders (created_at)
 WITH (FILLFACTOR = 90);
 ```
 
-- SQL Server FILLFACTOR=0 tương đương 100 khi build/rebuild; không tự duy trì tỷ lệ trống sau đó. Giảm chỉ khi đo thấy split đáng kể và lợi ích bù mật độ/cache giảm.
-- PostgreSQL B-tree mặc định fillfactor=90, khác heap mặc định=100. Heap fillfactor dành chỗ cho tuple version/HOT, còn index fillfactor dành chỗ trong page index. ALTER TABLE SET fillfactor không tự viết lại mọi page cũ.
+- SQL Server `FILLFACTOR = 0` tương đương `100` khi build/rebuild; không tự duy trì tỷ lệ trống sau đó. Giảm chỉ khi đo thấy split đáng kể và lợi ích bù mật độ/cache giảm.
+- PostgreSQL B-tree mặc định `fillfactor = 90`, khác heap mặc định `100`. Heap `fillfactor` dành chỗ cho tuple version/HOT, còn index `fillfactor` dành chỗ trong page index. `ALTER TABLE ... SET (fillfactor = ...)` không tự viết lại mọi page cũ.
 - Không áp mức 70–90 cho mọi bảng update nhiều: update payload/key có cơ chế khác nhau. InnoDB có tham số và quy tắc page riêng, không dùng cú pháp FILLFACTOR của SQL Server/PostgreSQL.
 
 Không phải núm vặn query. Sai fillfactor = lãng phí RAM hoặc split như random UUID. Đo fragmentation / bloat rồi mới hạ.
@@ -2758,7 +2871,7 @@ B+ Tree thắng khi có **thứ tự**: equality, range, `ORDER BY`, prefix `LIK
 
 | Nhu cầu | Cấu trúc | Hệ |
 | ------- | -------- | --- |
-| Equality thuần, không range / sort | Hash | PostgreSQL `USING HASH`; SQL Server hash chỉ memory-optimized |
+| Equality thuần, không range / sort | Hash | PostgreSQL `USING HASH` (chỉ 1 cột, không `UNIQUE`, không `INCLUDE`/Index-Only Scan); SQL Server hash chỉ memory-optimized |
 | Full-text, JSON containment, array | GIN | PostgreSQL |
 | Hình học, range overlap, exclusion | GiST / SP-GiST | PostgreSQL (Phần 6, 9) |
 | Time-series append, query theo khoảng thô | BRIN | PostgreSQL (Phần 10) |
