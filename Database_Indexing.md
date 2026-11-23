@@ -196,6 +196,8 @@ Key tăng dần thường giúp insert tập trung vào một số page cuối, 
 
 **SQL Server:** UUIDv7 ghi vào `UNIQUEIDENTIFIER` không mặc nhiên được sắp theo timestamp RFC, vì comparator của kiểu này không theo thứ tự byte thông thường. Nếu cần insert tuần tự, kiểm chứng cách sinh/lưu GUID hoặc dùng `BIGINT IDENTITY` làm clustered key và UUID làm unique key riêng. [Quy tắc so sánh uniqueidentifier](https://learn.microsoft.com/en-us/sql/t-sql/data-types/uniqueidentifier-transact-sql?view=sql-server-ver17).
 
+**Xử lý khi gặp last-page latch contention (tải `INSERT` đồng thời cực cao vào key tăng dần):** trên SQL Server, dấu hiệu là chờ `PAGELATCH_EX` tăng mạnh trên leaf page cuối. Các hướng xử lý theo mức độ can thiệp: (1) thử `WITH (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON)` trên index (SQL Server 2019+) để điều phối luồng ghi vào page cuối mà không đổi schema; (2) gom `INSERT` theo batch thay vì từng dòng đơn lẻ; (3) với bảng ghi cực lớn, cân nhắc hash-bucket prefix (`bucket_id` tính từ hash, rồi PK `(bucket_id, id)`) hoặc partitioning theo hash — đánh đổi việc đọc range theo `id` phải duyệt qua các bucket. [OPTIMIZE_FOR_SEQUENTIAL_KEY](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-index-transact-sql?view=sql-server-ver17).
+
 ### Hai cách lưu trữ khác nhau: Heap Table và Clustered Index
 
 Đây là kiến thức nền quan trọng mà nhiều developer bỏ qua, nhưng nó ảnh hưởng trực tiếp đến cách bạn thiết kế schema và chọn primary key. Có hai cách database lưu trữ dữ liệu trên disk:
@@ -1182,6 +1184,8 @@ WHERE type = 'open' ORDER BY created_at DESC LIMIT 10;
 -- ✅ Index: (type, created_at DESC)
 ```
 
+**Cẩn thận khi ép index bằng Hint (`WITH (INDEX(...))`, `FORCE INDEX`, `pg_hint_plan`):** gắn hint cứng trong SQL là con dao hai lưỡi. Nó khóa chết plan ngay cả khi phân bố dữ liệu thay đổi (biến Seek thành thảm họa Key Lookup khi tỷ lệ dữ liệu tăng), và sẽ làm **vỡ query ở runtime** nếu sau này DBA đổi tên hoặc gộp/drop index đó. Chỉ dùng hint như biện pháp chữa cháy tạm trong sự cố (hoặc dùng **Query Store Plan Forcing** trên SQL Server để kiểm soát ngoài code ứng dụng) trong khi xử lý nguyên nhân gốc: statistics cũ, predicate không SARGable, implicit conversion hoặc parameter sniffing.
+
 
 ### Parameter sniffing: Plan đúng với lần chạy đầu, sai với lần sau
 
@@ -1518,9 +1522,11 @@ CREATE INDEX contacts_email ON contacts (email);
 SELECT * FROM contacts WHERE email = 'admin@example.com';
 ```
 
-Giả định attributes kiểu JSONB trên PostgreSQL và JSON hợp lệ trên các hệ còn lại. Expression B-tree trên attributes->>'email' phục vụ equality/range của property đó; GIN trên toàn JSONB phục vụ các operator như @>, không tự tăng tốc mọi path/so sánh. jsonb_path_ops là lựa chọn có tập operator khác mặc định, nên chọn theo query.
+Giả định `attributes` kiểu `JSONB` trên PostgreSQL và JSON hợp lệ trên các hệ còn lại. Expression B-tree trên `attributes->>'email'` phục vụ equality/range của property đó; `GIN` trên toàn `JSONB` phục vụ các operator như `@>`, không tự tăng tốc mọi path/so sánh. `jsonb_path_ops` là lựa chọn nhỏ hơn nhưng có tập operator hẹp hơn mặc định, nên chọn theo query. `GIN` cũng là lựa chọn chuẩn cho cột mảng (`tags TEXT[]` với toán tử `@>`, `&&`).
 
-SQL Server JSON_VALUE trả NVARCHAR(4000) theo dạng scalar thông thường; index trực tiếp biểu thức này có thể vượt key limit khi dữ liệu dài. Cast về kiểu/độ dài nghiệp vụ và validate trước để tránh truncation làm sai so sánh. [PostgreSQL JSON indexing](https://www.postgresql.org/docs/18/datatype-json.html#JSON-INDEXING), [SQL Server JSON indexes](https://learn.microsoft.com/en-us/sql/relational-databases/json/index-json-data?view=sql-server-ver17).
+**Bẫy `GIN fastupdate` và tail-latency p99 trên PostgreSQL:** mặc định `GIN` bật `fastupdate = on`, gom các thay đổi mới vào một *pending list* để tăng tốc ghi trung bình. Tuy nhiên, mỗi query đọc đều phải quét thêm pending list, và khi pending list chạm `gin_pending_list_limit` (mặc định 4 MB), **một câu `INSERT`/`UPDATE` ngẫu nhiên sẽ phải gánh trọn cú flush** sang cây GIN chính (có thể gây spike hàng trăm ms đến vài giây). Với bảng ghi nhiều nhạy cảm độ trễ p99, đo thực tế để cân nhắc `WITH (fastupdate = off)` hoặc hạ `gin_pending_list_limit` + cấu hình autovacuum dọn thường xuyên. [PostgreSQL GIN tips](https://www.postgresql.org/docs/18/gin.html#GIN-TIPS).
+
+SQL Server `JSON_VALUE` trả `NVARCHAR(4000)` theo dạng scalar thông thường; index trực tiếp biểu thức này có thể vượt key limit khi dữ liệu dài. Cast về kiểu/độ dài nghiệp vụ và validate trước để tránh truncation làm sai so sánh. [PostgreSQL JSON indexing](https://www.postgresql.org/docs/18/datatype-json.html#JSON-INDEXING), [SQL Server JSON indexes](https://learn.microsoft.com/en-us/sql/relational-databases/json/index-json-data?view=sql-server-ver17).
 
 
 ### Ràng buộc duy nhất và giá trị NULL: Khác nhau giữa các hệ
@@ -1734,12 +1740,13 @@ ALTER INDEX users_email_idx ON users REBUILD WITH (ONLINE = ON);  -- Enterprise 
 
 Chỉ rebuild/reorganize khi số liệu cho thấy lợi ích đủ bù chi phí I/O, log và blocking. Page density thấp còn ảnh hưởng cache/độ sâu, kể cả lookup. Không dùng ngưỡng fragmentation cố định cho mọi index; nhiều trường hợp cải thiện sau rebuild thực chất đến từ statistics mới. `fillfactor` thấp hơn có thể giảm split nhưng tăng số page.
 
-**Cải tiến chống phình B-tree ở PostgreSQL hiện đại:**
+**Cải tiến chống phình B-tree & nén Index:**
 
-- **B-tree Deduplication (PG 13+):** nén các TID có cùng giá trị key thành một posting list, giúp index trên cột lặp nhiều (`tenant_id`, `status`) nhỏ hơn đáng kể so với trước đây.
-- **Bottom-up Index Deletion (PG 14+):** trước khi split một leaf page sắp đầy, PostgreSQL chủ động dọn các index entry trỏ đến tuple version đã chết — giảm mạnh bloat index khi `UPDATE` các cột *không* nằm trong index nhưng không đạt điều kiện HOT.
+- **PostgreSQL — B-tree Deduplication (PG 13+):** nén các TID có cùng giá trị key thành một posting list, giúp index trên cột lặp nhiều (`tenant_id`, `status`) nhỏ hơn đáng kể so với trước đây.
+- **PostgreSQL — Bottom-up Index Deletion (PG 14+):** trước khi split một leaf page sắp đầy, PostgreSQL chủ động dọn các index entry trỏ đến tuple version đã chết — giảm mạnh bloat index khi `UPDATE` các cột *không* nằm trong index nhưng không đạt điều kiện HOT.
+- **SQL Server — Index Compression (`ROW` / `PAGE`):** từ SQL Server 2016 SP1+, cả **Standard Edition** đã hỗ trợ `WITH (DATA_COMPRESSION = PAGE)` (hoặc `ROW`). Với bảng/index lớn nhiều giá trị lặp, `PAGE` compression thường giảm **40–70% dung lượng, buffer pool và logical reads**, đổi lại tăng nhẹ CPU khi đọc/ghi (đặc biệt trên trang hay bị update dày, cân nhắc `ROW` thay vì `PAGE`). Kiểm chứng trước bằng `sp_estimate_data_compression_savings`.
 
-[SQL Server: bảo trì theo workload và page density](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/reorganize-and-rebuild-indexes?view=sql-server-ver17), [PostgreSQL: B-tree deduplication](https://www.postgresql.org/docs/18/btree.html#BTREE-DEDUPLICATION).
+[SQL Server: bảo trì theo workload và page density](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/reorganize-and-rebuild-indexes?view=sql-server-ver17), [SQL Server: Data Compression](https://learn.microsoft.com/en-us/sql/relational-databases/data-compression/data-compression?view=sql-server-ver17), [PostgreSQL: B-tree deduplication](https://www.postgresql.org/docs/18/btree.html#BTREE-DEDUPLICATION).
 
 ## Phần 7. Kỹ thuật thao tác dữ liệu hiệu quả
 
@@ -2454,7 +2461,23 @@ DROP TABLE logs_2023_january;  -- hoặc DETACH PARTITION [CONCURRENTLY] rồi D
 TRUNCATE TABLE logs WITH (PARTITIONS (1));
 ```
 
-PostgreSQL `DROP` partition trực tiếp có thể cần khóa mạnh (`ACCESS EXCLUSIVE`) trên bảng parent; `DETACH PARTITION CONCURRENTLY` có điều kiện và không chạy trong transaction block — nên đặt `SET lock_timeout` khi chạy DDL trên production. `PK`/`UNIQUE` trên bảng partitioned PostgreSQL phải bao gồm partition key; MySQL cũng có hạn chế unique key với partition expression. SQL Server `SWITCH` cần schema/index/constraint tương thích. Xác minh toàn bộ dữ liệu trong partition đã hết retention, không chỉ tên partition. [PostgreSQL partitioning](https://www.postgresql.org/docs/18/ddl-partitioning.html).
+PostgreSQL `DROP` partition trực tiếp có thể cần khóa mạnh (`ACCESS EXCLUSIVE`) trên bảng parent; `DETACH PARTITION CONCURRENTLY` có điều kiện và không chạy trong transaction block — nên đặt `SET lock_timeout` khi chạy DDL trên production. `PK`/`UNIQUE` trên bảng partitioned PostgreSQL phải bao gồm partition key; MySQL cũng có hạn chế unique key với partition expression. SQL Server `SWITCH` cần schema/index/constraint tương thích. Xác minh toàn bộ dữ liệu trong partition đã hết retention, không chỉ tên partition.
+
+**3 bẫy Index thường gặp trên bảng Partitioned:**
+
+- **PostgreSQL `CREATE INDEX CONCURRENTLY` trên bảng partitioned:** không hỗ trợ chạy trực tiếp trên bảng parent; để tránh khóa bảng production, phải tạo theo 3 bước:
+  ```sql
+  -- 1. Tạo index rỗng trên parent (chưa build, chưa hợp lệ cho đến khi đủ partition)
+  CREATE INDEX idx_logs_tenant ON ONLY logs (tenant_id, created_at);
+  -- 2. Build online trên từng partition con
+  CREATE INDEX CONCURRENTLY idx_logs_2026_01_tenant ON logs_2026_01 (tenant_id, created_at);
+  -- 3. Gắn index con vào index parent (tự hợp lệ khi gắn đủ mọi partition)
+  ALTER INDEX idx_logs_tenant ATTACH PARTITION idx_logs_2026_01_tenant;
+  ```
+- **SQL Server — Non-aligned index phá `SWITCH` / `TRUNCATE`:** nếu tạo nonclustered index không partition theo cùng partition scheme (non-aligned), thao tác `SWITCH PARTITION` và `TRUNCATE TABLE ... WITH (PARTITIONS (...))` sẽ bị từ chối.
+- **Query thiếu partition key:** khi bảng có hàng trăm/nghìn partition mà `WHERE` không lọc theo partition key (không prune được), optimizer phải lập kế hoạch và dò trên **tất cả các partition** — làm tăng mạnh planning time và logical reads so với bảng thường.
+
+[PostgreSQL partitioning](https://www.postgresql.org/docs/18/ddl-partitioning.html).
 
 
 ### Bảng sắp xếp trước: Tối ưu cho quét phạm vi
